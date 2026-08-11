@@ -1,0 +1,23 @@
+[Unit]
+Description=Fingerprint Capture (Pi-side sum-bus tap -> nowplaying-server /api/fingerprint)
+# Taps the PipeWire dsp-in sum-bus monitor, so PipeWire + WirePlumber must be up
+# and CamillaDSP must be running (dsp-in is its capture node). source-router gates
+# capture on its focused_source WS :8080. nowplaying-server runs shazamio on the clip.
+After=source-router.service nowplaying-server.service camilladsp.service pipewire.service wireplumber.service
+Wants=source-router.service nowplaying-server.service camilladsp.service
+Requires=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+# PipeWire socket env for pw-record (system-mode PipeWire). Matches source-router.service.
+Environment=XDG_RUNTIME_DIR=/run/pipewire
+Environment=PIPEWIRE_REMOTE=pipewire-0
+ExecStart=/opt/vibesbox-src/venv/bin/python3 /opt/vibesbox-src/scripts/fingerprint_capture.py
+Restart=always
+RestartSec=3
+User=root
+TimeoutStopSec=10
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

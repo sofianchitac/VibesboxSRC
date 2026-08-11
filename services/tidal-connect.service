@@ -1,0 +1,28 @@
+[Unit]
+Description=Tidal Connect (Dockerised iFi binaries) -> Tidal snd-aloop
+# Needs the Docker engine, the Tidal loopback card (hw:Tidal == card 15), and the network
+# up for mDNS discovery. PipeWire / source-router are NOT hard deps: source_router detects
+# the loopback activity and starts ardftsrc-bridge@tidal whenever the source appears.
+After=docker.service alsa-loopback.service network-online.target avahi-daemon.service
+Wants=network-online.target
+Requires=docker.service alsa-loopback.service
+
+[Service]
+# Always-on, like squeezelite/shairport-sync: the container must stay up so the device is
+# permanently discoverable in the Tidal app. systemd owns the lifecycle. --rm + the
+# ExecStartPre rm guard keep a crash from leaving a stale container that blocks the restart.
+ExecStartPre=-/usr/bin/docker rm -f tidal_connect
+ExecStart=/usr/bin/docker run --rm --name tidal_connect \
+    --network host \
+    --device /dev/snd \
+    -v /var/run/dbus:/var/run/dbus \
+    --env-file /opt/vibesbox-src/tidal-connect/tidal.env \
+    vibesbox-tidal-connect:latest
+ExecStop=/usr/bin/docker stop -t 5 tidal_connect
+Restart=always
+RestartSec=5
+# First start may pull/initialise; give the engine room before systemd calls it failed.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

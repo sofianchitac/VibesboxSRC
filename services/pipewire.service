@@ -1,0 +1,33 @@
+# VibesboxSRC v2 — SYSTEM-mode PipeWire (deploy to /etc/systemd/system/pipewire.service).
+#
+# The appliance is headless with no graphical user session, so PipeWire runs as a SYSTEM
+# service under a dedicated unprivileged `pipewire` user (NOT the per-user units shipped by
+# the distro, which are masked via `systemctl --global mask`). WirePlumber (separate unit)
+# is the session manager; CamillaDSP (native PipeWire backend) and source_router.py connect
+# as clients via XDG_RUNTIME_DIR=/run/pipewire.
+#
+# Busless on purpose: for the ALSA-only graph (bluez deferred) WirePlumber's alsa monitor
+# does not require a session bus, so we do NOT wrap in dbus-run-session (that was a
+# bench-only isolation hack). Revisit when wiring bluez (system bus + D-Bus policy).
+[Unit]
+Description=Vibesbox system-wide PipeWire (v2 audio backbone)
+After=alsa-loopback.service usb-gadget.service
+Wants=alsa-loopback.service
+
+[Service]
+User=pipewire
+Group=pipewire
+SupplementaryGroups=audio bluetooth
+RuntimeDirectory=pipewire
+RuntimeDirectoryMode=0750
+Environment=XDG_RUNTIME_DIR=/run/pipewire
+ExecStart=/usr/bin/pipewire
+Restart=on-failure
+RestartSec=2
+# Realtime scheduling without rtkit/D-Bus (PipeWire's module-rt uses these rlimits).
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+Nice=-11
+
+[Install]
+WantedBy=multi-user.target

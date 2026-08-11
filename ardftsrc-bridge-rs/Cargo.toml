@@ -1,0 +1,27 @@
+[package]
+name = "ardftsrc-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "VibesboxSRC v3 — native Rust per-source ARDFTSRC resampler bridge (replaces the ffmpeg/librempeg bridge)"
+license = "MIT OR Apache-2.0"
+
+# Gate spikes live in src/bin/ (auto-discovered):
+#   gate1_output      — confirms the ALSA "pipewire" plugin creates source.<name>.ardftsrc (Gate 1)
+#   gate2_throughput  — measures ardftsrc realtime factor on the Pi 4B at candidate quality (Gate 2)
+# The full bridge (src/main.rs) is written only after both gates pass.
+
+[dependencies]
+# Same algorithm as librempeg's ardftsrc filter, native Rust. NEON FFT is on by
+# default (Pi 4B Cortex-A72). Pinned for reproducibility on the appliance.
+ardftsrc = "0.0.15"
+# ALSA capture (hw:<dev>) and the "pipewire" output PCM. Only gate1_output and the
+# bridge use this; gate2_throughput is pure CPU and does not.
+alsa = "0.9"
+# Bounded SPSC ring between the capture thread and the resampler thread.
+ringbuf = "0.4"
+
+# Gate 2 must measure *release* throughput — keep this representative of production.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

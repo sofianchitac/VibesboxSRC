@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically check LattePanda mDNS IP and reload nginx on change
+
+[Timer]
+# Fire one minute after boot, then every minute thereafter. Cheap (one getent
+# call + a state-file diff); the actual nginx reload only happens on change.
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=lattepanda-watcher.service
+
+[Install]
+WantedBy=timers.target

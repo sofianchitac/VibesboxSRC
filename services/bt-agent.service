@@ -1,0 +1,22 @@
+[Unit]
+Description=Bluetooth Pairing Agent (NoInputNoOutput)
+After=bluetooth.service
+Requires=bluetooth.service
+Before=bluealsa.service
+
+[Service]
+Type=simple
+# bt-agent from bluez-tools registers a proper headless D-Bus agent.
+# NoInputNoOutput means: auto-accept all pairing requests with no PIN/confirmation.
+# This is what allows phones to pair silently — it responds to the D-Bus
+# RequestConfirmation / RequestPasskey method calls that bluetoothctl pipe
+# cannot handle.
+ExecStart=/usr/bin/bt-agent -c NoInputNoOutput
+Restart=on-failure
+RestartSec=5
+User=root
+TimeoutStopSec=5
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

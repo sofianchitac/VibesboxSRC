@@ -1,0 +1,12 @@
+[Unit]
+Description=ALSA Loopback Devices for Audio Routing
+After=sound.target
+Before=camilladsp.service squeezelite.service shairport-sync.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash /opt/vibesbox-src/scripts/load_aloop.sh
+
+[Install]
+WantedBy=multi-user.target

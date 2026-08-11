@@ -1,0 +1,30 @@
+[Unit]
+Description=ARDFTSRC Bridge — native Rust DFT resampler for %i
+# v3: reads the raw ALSA device, emits a source.%i.ardftsrc PipeWire node (via the ALSA
+# "pipewire" plugin output), so PipeWire + WirePlumber must be up alongside the loopback cards.
+After=alsa-loopback.service pipewire.service wireplumber.service
+Requires=alsa-loopback.service
+Wants=pipewire.service wireplumber.service
+# The @tv instance is stopped/started by source_router on every TV LPCM<->AC-3 format
+# change (Stage 2). Disable systemd's start rate-limit so rapid switches (scrubbing a
+# 5.1 movie) can't trip "start request repeated too quickly" and strand the source.
+# Harmless for the other on-demand instances, which effectively never restart.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# PipeWire socket env for the bridge's ALSA "pipewire" plugin output (system-mode PipeWire;
+# must match pipewire.service / source-router.service — VALIDATE AT DEPLOY, Risk #8).
+Environment=XDG_RUNTIME_DIR=/run/pipewire
+Environment=PIPEWIRE_REMOTE=pipewire-0
+ExecStart=/opt/vibesbox-src/bin/ardftsrc-bridge %i
+# Bridge-down = source-dead (the source can't reach dsp-in without it), so self-heal fast
+# (spec §6). Keep SIGKILL (snd_pcm_readi can block uninterruptibly on isochronous hw reads).
+Restart=on-failure
+RestartSec=2
+User=root
+KillSignal=SIGKILL
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

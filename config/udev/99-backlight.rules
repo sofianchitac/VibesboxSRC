@@ -1,0 +1,19 @@
+# /etc/udev/rules.d/99-backlight.rules
+#
+# Grants write access to the DSI touchscreen backlight brightness file
+# for members of the 'video' group.
+#
+# This allows source_router (running as the kiosk user, who is in 'video') to
+# set brightness from the UI power menu without sudo.
+#
+# Matches ANY backlight device rather than a fixed kernel name: the DSI
+# backlight's name encodes the I2C bus number ("10-0045" on the Pi 4B), which
+# changes across Pi models/kernels. %p expands to the device's sysfs path.
+#
+# Deploy to: /etc/udev/rules.d/99-backlight.rules
+# Activate:  sudo udevadm trigger --subsystem-match=backlight
+#            (or reboot)
+
+SUBSYSTEM=="backlight", \
+    RUN+="/bin/chgrp video /sys%p/brightness", \
+    RUN+="/bin/chmod g+w /sys%p/brightness"

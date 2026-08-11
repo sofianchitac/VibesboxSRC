@@ -1,0 +1,118 @@
+# VibesboxSRC v2 (PipeWire backbone) — static 6ch passthrough, the ONLY config
+# (loaded once at boot and left running; the v2-era dsp_2ch.yml S/PDIF downmix
+# was retired with the Pi 5 migration — see git history).
+#
+# Uses CamillaDSP's NATIVE PipeWire backend (requires the camilladsp-linux-pipewire
+# prebuilt — the stock ALSA-only 4.1.3 on the box does NOT have it; swap the binary at
+# deploy). CamillaDSP registers its own filter nodes "dsp-in" (6ch capture) and "dsp-out"
+# (6ch playback); source_router.py links sources -> dsp-in and dsp-out -> the active
+# output sink. No pcm.dsp_in/dsp_out ALSA-pipewire PCMs and no sink.dsp-in null-sink any
+# more (both removed) — sources feed dsp-in directly, PipeWire sums them in F32.
+# node_group_name pins capture+playback to one driver/clock (dissolves the P3 dual-domain
+# drift watch-item). PipeWire is F32 internally, so no capture/playback format is set.
+#
+# Field names (node_name / node_group_name / autoconnect_to) validated against the
+# 4.1.3 pipewire prebuilt at the 2026-05-29 cutover.
+description: "v2 static 6ch passthrough (native PipeWire dsp-in -> dsp-out)"
+devices:
+  adjust_period: null
+  capture:
+    type: PipeWire
+    channels: 6
+    node_name: dsp-in
+    node_description: "Vibesbox DSP input (6ch sum point)"
+    node_group_name: vibesbox-dsp   # shared driver/clock with playback (clock coherence)
+    autoconnect_to: null            # source_router.py is the sole routing authority
+  capture_samplerate: 96000
+  chunksize: 512  # = PipeWire quantum; also matches PERIOD_FRAMES in ndi_transmitter.py (512 chain, 2026-06-10)
+  enable_rate_adjust: false   # PipeWire owns the clock/drift (plan §3.4 / Risk #3)
+  multithreaded: null
+  playback:
+    type: PipeWire
+    channels: 6
+    node_name: dsp-out
+    node_description: "Vibesbox DSP output (6ch)"
+    node_group_name: vibesbox-dsp   # same group as capture
+    autoconnect_to: null            # daemon links dsp-out -> sink.ndi-feed
+  queuelimit: null
+  rate_measure_interval: null
+  resampler:
+    type: Synchronous
+  samplerate: 96000
+  silence_threshold: null
+  silence_timeout: null
+  stop_on_rate_change: null
+  target_level: 1536  # 3 x chunksize; nominal only — inert under the PipeWire backend
+  volume_limit: null
+  volume_ramp_time: null
+  worker_threads: null
+# 2026-07-29: the `intersample_headroom` Gain (-4.0 dB) that used to live here MOVED into
+# ardftsrc-bridge-rs (`HEADROOM` in src/main.rs, applied before the f64->i32 clamp). It was
+# ineffective here: CamillaDSP is downstream of the source.<name>.ardftsrc nodes, so the
+# bridge's integer clamp had already hard-clipped the intersample peaks this was meant to
+# make room for. Level end-to-end is unchanged — gain and PipeWire's sum are both linear,
+# so -4 dB per source pre-sum == the -4 dB post-sum it replaces.
+filters: null
+mixers:
+  6ch_passthrough:
+    channels:
+      in: 6
+      out: 6
+    description: null
+    labels: null
+    mapping:
+    - dest: 0
+      mute: null
+      sources:
+      - channel: 0
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+    - dest: 1
+      mute: null
+      sources:
+      - channel: 1
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+    - dest: 2
+      mute: null
+      sources:
+      - channel: 2
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+    - dest: 3
+      mute: null
+      sources:
+      - channel: 3
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+    - dest: 4
+      mute: null
+      sources:
+      - channel: 4
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+    - dest: 5
+      mute: null
+      sources:
+      - channel: 5
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+pipeline:
+- bypassed: null
+  description: null
+  name: 6ch_passthrough
+  type: Mixer
+processors: null
+title: dsp_6ch (v2 static 6ch passthrough)

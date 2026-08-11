@@ -1,0 +1,20 @@
+[Unit]
+Description=Now Playing HTTP/WS Server (aggregates metadata for the kiosk)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/vibesbox-src/venv/bin/python3 /opt/vibesbox-src/scripts/nowplaying_server.py
+Restart=always
+RestartSec=3
+User=root
+TimeoutStopSec=5
+KillMode=mixed
+
+# Optional environment overrides (defaults: 0.0.0.0:8090, cache /run/vibesbox-nowplaying-cache.json)
+# Environment=NOWPLAYING_BIND=0.0.0.0
+# Environment=NOWPLAYING_PORT=8090
+
+[Install]
+WantedBy=multi-user.target

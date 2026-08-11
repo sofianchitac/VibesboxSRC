@@ -1,0 +1,12 @@
+[Unit]
+Description=USB Audio Gadget (UAC2)
+After=local-fs.target
+Before=camilladsp.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/vibesbox-src/scripts/usb_audio_gadget.sh
+
+[Install]
+WantedBy=multi-user.target

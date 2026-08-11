@@ -1,0 +1,43 @@
+[Unit]
+Description=NDI Output — 6ch Audio Transmitter (NDI SDK via Python)
+After=camilladsp.service alsa-loopback.service network-online.target avahi-daemon.service
+Requires=alsa-loopback.service
+Wants=network-online.target camilladsp.service
+
+[Service]
+Type=simple
+ExecStart=/opt/vibesbox-src/venv/bin/python3 /opt/vibesbox-src/scripts/ndi_transmitter.py
+Restart=on-failure
+RestartSec=5
+User=root
+
+# RT scheduling: the transmitter drains the NDITX loopback on a 512/96kHz (~5.3ms)
+# cadence. At SCHED_OTHER it can be preempted by the Chromium kiosk (which runs at
+# nice -8), starving sink.ndi-feed -> loopback overrun -> audible crackle on the
+# LattePanda. FIFO 20 preempts ALL SCHED_OTHER (incl. the kiosk) while staying well
+# below PipeWire's audio-graph RT threads (FIFO 83-88), so the DSP graph is never
+# starved. LimitRTPRIO must be >= the priority for the policy to stick. (2026-06-30)
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=20
+LimitRTPRIO=21
+
+# NDI source name as shown on the network.
+Environment=NDI_TX_NAME=VibesboxSRC-5.1
+
+# libndi.so location — change only if you have installed the NDI SDK elsewhere.
+Environment=NDI_LIB_PATH=/usr/local/lib/libndi.so
+
+# ALSA read side of the NDITX snd-aloop loopback.
+# hw:NDITX,1,0 = card NDITX, device 1, subdevice 0 (snd-aloop read side).
+# Do NOT change unless you have modified load_aloop.sh.
+Environment=NDI_ALSA_DEV=hw:NDITX,1,0
+
+# Must match CamillaDSP 6ch output config samplerate and chunksize.
+# NDI_PERIOD 1024 -> 512 with the rest of the 512 chain (2026-06-10 latency phase 2).
+# This env OVERRIDES the ndi_transmitter.py file default — edit here, not there.
+Environment=NDI_RATE=96000
+Environment=NDI_ALSA_CH=6
+Environment=NDI_PERIOD=512
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Reload nginx when the DSP unit's mDNS IP changes
+After=network-online.target nginx.service
+Wants=network-online.target
+# nginx.service is required only because we soft-reload it on change.
+Requires=nginx.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/vibesbox-src/scripts/lattepanda-watcher.sh
+# Run as root so we can systemctl reload nginx without an extra polkit dance.
+User=root

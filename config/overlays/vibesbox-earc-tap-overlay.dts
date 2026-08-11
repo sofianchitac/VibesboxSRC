@@ -1,0 +1,99 @@
+// Vibesbox eARC I2S tap — Pi 5 ONLY (RP1 i2s1, 4-lane slave capture).
+//
+// Captures the 8ch LPCM I2S output of the SiI9437 eARC receiver inside the
+// Lindy 38368 extractor (tap wiring: docs/Lattice/earc-i2s-tap-pinout.md):
+//
+//   SiI9437 pin 10 SCK  -> GPIO 18      pin 13 SD1 -> GPIO 22
+//   SiI9437 pin 11 WS   -> GPIO 19      pin 14 SD2 -> GPIO 24
+//   SiI9437 pin 12 SD0  -> GPIO 20      pin 15 SD3 -> GPIO 26
+//
+// Structure cloned from the kernel's hifiberry-adc8x overlay (rpi-6.12.y), with
+// two deliberate differences:
+//   * function "i2s1" / target &i2s_clk_consumer — the RP1's SLAVE-synthesis DW
+//     I2S instance (rp1_i2s1). The SiI9437 masters BCLK/WS; the Pi only listens.
+//     (adc8x uses "i2s0"/&i2s_clk_producer because there the Pi is clock master.)
+//   * generic simple-audio-card + a stub codec instead of a HiFiBerry machine
+//     driver, with the stub codec declared bitclock/frame master so the ASoC
+//     core programs the DW DAI as consumer (CBM_CFM).
+//
+// Codec choice: "linux,spdif-dir" (snd_soc_spdif_rx), NOT the "snd-soc-dummy"
+// node the HiFiBerry overlays create. snd-soc-dummy has no OF match table, so a
+// DT node using it never binds — harmless for HiFiBerry (nothing references
+// their node) but fatal here, where simple-audio-card holds -EPROBE_DEFER on it
+// forever ("asoc-simple-card: parse error" in /sys/kernel/debug/devices_deferred).
+// spdif-dir is a capture-only stub with no hardware behind it; measured, the
+// merged CPU-codec constraints are CHANNELS [2 8], RATE [8000 384000],
+// FORMAT S16_LE/S24_LE/S32_LE — it does not narrow the DW DAI.
+//
+// Slave-mode caveat: there is NO incoming-rate autodetect — open the capture at
+// the rate the TV is set to (fix the TV to PCM 48 kHz). Frames are 64-bit
+// (2 x 32-bit slots); samples arrive 24-bit left-justified in S32.
+//
+// Compile + install (see config/overlays/README.md):
+//   dtc -@ -I dts -O dtb -o vibesbox-earc-tap.dtbo vibesbox-earc-tap-overlay.dts
+//   sudo cp vibesbox-earc-tap.dtbo /boot/firmware/overlays/
+//   echo "dtoverlay=vibesbox-earc-tap" | sudo tee -a /boot/firmware/config.txt
+//
+// ★ VALIDATED ON HARDWARE 2026-07-27 (Pi 5, kernel 6.18.34+rpt-rpi-v8): card
+// "eARC" enumerates, 8ch/S32_LE/48kHz capture returns live audio, no xruns.
+// Lane->channel map beyond SD0 still unmeasured (needs 5.1 LPCM from the TV).
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2712";
+
+	fragment@0 {
+		target = <&gpio>;
+		__overlay__ {
+			rp1_i2s1_earc: rp1_i2s1_earc {
+				function = "i2s1";
+				pins = "gpio18", "gpio19", "gpio20",
+				       "gpio22", "gpio24", "gpio26";
+				bias-disable;
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&i2s_clk_consumer>;
+		__overlay__ {
+			pinctrl-names = "default";
+			pinctrl-0 = <&rp1_i2s1_earc>;
+			status = "okay";
+		};
+	};
+
+	fragment@2 {
+		target-path = "/";
+		__overlay__ {
+			earc_codec: earc-codec {
+				#sound-dai-cells = <0>;
+				compatible = "linux,spdif-dir";
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@3 {
+		target = <&sound>;
+		__overlay__ {
+			compatible = "simple-audio-card";
+			simple-audio-card,name = "eARC";
+			simple-audio-card,format = "i2s";
+			// Codec (= the SiI9437, represented by the dummy) masters
+			// BCLK + WS -> the RP1 DAI runs as clock consumer.
+			simple-audio-card,bitclock-master = <&earc_dai>;
+			simple-audio-card,frame-master = <&earc_dai>;
+			status = "okay";
+
+			simple-audio-card,cpu {
+				sound-dai = <&i2s_clk_consumer>;
+			};
+			earc_dai: simple-audio-card,codec {
+				sound-dai = <&earc_codec>;
+			};
+		};
+	};
+};

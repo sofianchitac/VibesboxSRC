@@ -1,0 +1,8 @@
+singleton Theme 1.0 Theme.qml
+RouterClient 1.0 RouterClient.qml
+CdspClient 1.0 CdspClient.qml
+WakeSection 1.0 WakeSection.qml
+StatColumn 1.0 StatColumn.qml
+SourceButton 1.0 SourceButton.qml
+MeterChannel 1.0 MeterChannel.qml
+PowerOverlay 1.0 PowerOverlay.qml

@@ -1,0 +1,44 @@
+# VibesboxSRC v2 — SYSTEM-mode WirePlumber (deploy to /etc/systemd/system/wireplumber.service).
+#
+# Session manager for the system-mode PipeWire above. Runs as the same `pipewire` user and
+# shares XDG_RUNTIME_DIR=/run/pipewire (the dir is owned/created by pipewire.service via
+# RuntimeDirectory=). Applies the Vibesbox monitor.alsa rules in
+# /etc/wireplumber/wireplumber.conf.d/51-*.conf + 52-*.conf (sink.ndi-feed, source.usb).
+#
+# BindsTo=pipewire.service: if PipeWire stops/restarts, WirePlumber follows (a session
+# manager against a dead daemon is useless).
+#
+# D-Bus: WirePlumber 0.5.x does NOT require a session bus for the ALSA-only path (verified
+# busless under runuser on 2026-05-28 — no exit-70). WP 0.4.13 did require one, hence the
+# earlier dbus-run-session wrapper; that's removed now. SYSTEM bus stays reachable at
+# /run/dbus/system_bus_socket for bluez wiring later (Risk #5/#8).
+#
+# State: the pipewire user has no home (--no-create-home), so $HOME/.local/state is
+# unwritable. StateDirectory=wireplumber gives /var/lib/wireplumber (owned by the user);
+# XDG_STATE_HOME=/var/lib points WirePlumber there.
+[Unit]
+Description=Vibesbox system-wide WirePlumber (PipeWire session manager)
+After=pipewire.service
+BindsTo=pipewire.service
+
+[Service]
+User=pipewire
+Group=pipewire
+SupplementaryGroups=audio bluetooth
+StateDirectory=wireplumber
+Environment=XDG_RUNTIME_DIR=/run/pipewire
+Environment=XDG_STATE_HOME=/var/lib
+# -p main-systemwide: the system-mode profile. Disables the session-only features
+# (reserve-device, logind, portal) AND monitor.bluez.seat-monitoring — the headless
+# `pipewire` user has no active logind seat, so under the default `main` profile the
+# bluez monitor never activates audio devices. Required for the A2DP-sink path
+# (config/wireplumber/wireplumber.conf.d/53-vibesbox-bluez.conf).
+ExecStart=/usr/bin/wireplumber -p main-systemwide
+Restart=on-failure
+RestartSec=2
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+Nice=-11
+
+[Install]
+WantedBy=multi-user.target

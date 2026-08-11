@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Vibesbox Remote</title>
+    <link rel="stylesheet" href="remote.css?v=6">
+</head>
+
+<body>
+    <!-- Wordmark only — the remote is neither unit, so it carries no SRC/DSP
+         suffix. ../vibesbox-logo-grey.svg keeps the full lockup for the kiosk. -->
+    <header class="remote-header">
+        <img src="vibesbox-wordmark.svg" alt="Vibesbox" class="header-logo">
+        <h1>Remote</h1>
+    </header>
+
+    <main class="grid">
+
+        <!-- ── SRC panel ─────────────────────────────────────────────── -->
+        <section class="panel" id="panel-src">
+            <div class="panel-header">
+                <h2>Sources</h2>
+                <span class="status-dot" id="src-status" title="disconnected"></span>
+            </div>
+            <div class="panel-body">
+                <div class="stats-row">
+                    <div class="stat-col">
+                        <span class="stat-label">INPUT</span>
+                        <div class="stat-val-large">
+                            <span id="src-input-rate">—</span><span class="unit">kHz</span>
+                        </div>
+                        <span class="stat-val-med" id="src-source">—</span>
+                    </div>
+                    <div class="stat-col">
+                        <span class="stat-label">RESAMPLER</span>
+                        <div class="stat-val-large orange">
+                            <span id="src-output-rate">96</span><span class="unit">kHz</span>
+                        </div>
+                        <span class="stat-val-med" id="src-engine">—</span>
+                        <span class="stat-val-small" id="src-engine-profile">—</span>
+                    </div>
+                    <div class="stat-col">
+                        <span class="stat-label">OUTPUT</span>
+                        <div class="stat-val-large orange">
+                            <span id="src-channels">—</span>
+                        </div>
+                        <span class="stat-val-med" id="src-output-path">—</span>
+                        <span class="stat-val-small" id="src-buffer">—</span>
+                    </div>
+                </div>
+
+                <!-- Pills are rendered by remote.js from the daemon's state frame,
+                     so a new source appears here without touching this file. -->
+                <div class="sources-row" id="src-sources-row"></div>
+
+                <div class="footer-row">
+                    <button class="unmute-all-btn" id="src-unmute-all">Unmute All</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── DSP panel ─────────────────────────────────────────────── -->
+        <!-- No status dot: these are fire-and-forget OSC nudges, so there is
+             no reachability signal a dot could honestly report. -->
+        <section class="panel" id="panel-dsp">
+            <div class="panel-header">
+                <h2>DSP</h2>
+            </div>
+            <div class="panel-body">
+                <p class="dsp-note">
+                    Relative steps sent to REAPER. The LattePanda kiosk shows the value.
+                </p>
+
+                <div class="dsp-rows">
+                    <div class="dsp-row">
+                        <span class="dsp-label">VOLUME</span>
+                        <button class="dsp-btn" data-control="volume" data-direction="down">&minus;</button>
+                        <button class="dsp-btn" data-control="volume" data-direction="up">+</button>
+                    </div>
+                    <div class="dsp-row">
+                        <span class="dsp-label">BASS</span>
+                        <button class="dsp-btn" data-control="bass" data-direction="down">&minus;</button>
+                        <button class="dsp-btn" data-control="bass" data-direction="up">+</button>
+                    </div>
+                    <div class="dsp-row">
+                        <span class="dsp-label">TREBLE</span>
+                        <button class="dsp-btn" data-control="treble" data-direction="down">&minus;</button>
+                        <button class="dsp-btn" data-control="treble" data-direction="up">+</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Now Playing panel ─────────────────────────────────────── -->
+        <section class="panel" id="panel-np">
+            <div class="panel-header">
+                <h2>Now Playing</h2>
+                <span class="status-dot" id="np-status" title="disconnected"></span>
+            </div>
+            <div class="panel-body">
+                <div class="np-card" id="np-card">
+                    <div class="np-idle">No source active.</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Break-glass panel ─────────────────────────────────────── -->
+        <section class="panel" id="panel-bg">
+            <div class="panel-header">
+                <h2>Break-Glass</h2>
+                <span class="status-dot" id="bg-status" title="unknown"></span>
+            </div>
+            <div class="panel-body">
+                <p class="bg-note">
+                    Remote escape hatch for the LattePanda kiosk.
+                    Tap twice to confirm.
+                </p>
+
+                <div class="bg-buttons">
+                    <button class="bg-btn" data-action="cmd">
+                        <span class="bg-btn-title">Open cmd</span>
+                        <span class="bg-btn-sub">Pops a console window on the LattePanda</span>
+                    </button>
+                    <button class="bg-btn" data-action="explorer">
+                        <span class="bg-btn-title">Open Explorer</span>
+                        <span class="bg-btn-sub">Launches explorer.exe</span>
+                    </button>
+                    <button class="bg-btn" data-action="kill-explorer">
+                        <span class="bg-btn-title">Kill Explorer</span>
+                        <span class="bg-btn-sub">Terminates explorer.exe windows</span>
+                    </button>
+                    <button class="bg-btn" data-action="stop-kiosk">
+                        <span class="bg-btn-title">Stop Kiosk</span>
+                        <span class="bg-btn-sub">Ends the VibesboxKiosk scheduled task</span>
+                    </button>
+                    <button class="bg-btn" data-action="start-kiosk">
+                        <span class="bg-btn-title">Start Kiosk</span>
+                        <span class="bg-btn-sub">Runs the VibesboxKiosk scheduled task</span>
+                    </button>
+                    <button class="bg-btn danger" data-action="reboot">
+                        <span class="bg-btn-title">Reboot</span>
+                        <span class="bg-btn-sub">Restarts the LattePanda</span>
+                    </button>
+                    <button class="bg-btn danger" data-action="shutdown">
+                        <span class="bg-btn-title">Shutdown</span>
+                        <span class="bg-btn-sub">Powers off the LattePanda</span>
+                    </button>
+                </div>
+
+                <div class="bg-meta" id="bg-meta">—</div>
+            </div>
+        </section>
+
+    </main>
+
+    <script src="remote.js?v=5"></script>
+</body>
+
+</html>

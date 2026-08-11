@@ -1,0 +1,25 @@
+[Unit]
+Description=Vibesbox Source Router Daemon (v2 PipeWire backbone)
+# Replaces auto-router.service. PipeWire + WirePlumber must be up (the daemon drives the
+# graph via pw-dump/pw-link) and CamillaDSP must be reachable (the daemon pushes its static
+# config to create the dsp-in/dsp-out nodes).
+After=camilladsp.service pipewire.service wireplumber.service
+Wants=camilladsp.service
+Requires=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+# PipeWire socket env for the pw-* CLI + CamillaDSP's native backend. Matches the SYSTEM-MODE
+# PipeWire deploy (plan Risk #8: dedicated pipewire system user, /run/pipewire, pipewire-0
+# socket). VALIDATED at the 2026-05-29 cutover.
+Environment=XDG_RUNTIME_DIR=/run/pipewire
+Environment=PIPEWIRE_REMOTE=pipewire-0
+ExecStart=/opt/vibesbox-src/venv/bin/python3 /opt/vibesbox-src/scripts/source_router.py
+Restart=always
+RestartSec=3
+User=root
+TimeoutStopSec=10
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

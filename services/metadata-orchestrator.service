@@ -1,0 +1,20 @@
+[Unit]
+Description=Metadata Orchestrator (per-source producers → nowplaying-server)
+# v2: ordered after source-router (the v2 router that replaced auto-router); the old
+# auto-router coupling would pull the retired, now-masked v1 daemon into a fail-restart loop.
+After=source-router.service nowplaying-server.service dbus.service network-online.target
+Wants=source-router.service nowplaying-server.service
+Requires=nowplaying-server.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/vibesbox/nowplaying.env
+ExecStart=/opt/vibesbox-src/venv/bin/python3 /opt/vibesbox-src/scripts/metadata_orchestrator.py
+Restart=always
+RestartSec=3
+User=root
+TimeoutStopSec=10
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

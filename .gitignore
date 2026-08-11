@@ -1,0 +1,20 @@
+## OS
+.DS_Store
+venv/
+__pycache__/
+*.pyc
+
+## Remote dashboard — deployed copy holds the LattePanda host + break-glass token
+ui/remote/config.json
+
+## Tidal Connect — live env holds the deploy-time PLAYBACK_DEVICE (seeded from .example)
+tidal-connect/tidal.env
+
+## Rust v3 ardftsrc-bridge build artifacts
+ardftsrc-bridge-rs/target/
+
+## Research notes / datasheets — scratch material, not part of the deployed system
+docs/
+
+## NDI SDK installer — 61MB EULA-gated vendor blob, fetched per-machine from ndi.video
+NDI SDK/

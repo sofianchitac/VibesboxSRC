@@ -1,0 +1,33 @@
+[Unit]
+Description=TV eARC %i bitstream bridge — IEC 61937 decode -> source.tv.ardftsrc
+# Encoded variant of the TV eARC path, one templated instance per codec (@eac3, @ac3,
+# @dts): started by source_router (in place of ardftsrc-bridge@tv) when the eARC tap
+# carries an IEC 61937 %i bitstream. Needs PipeWire + WirePlumber up (pw-cat output
+# node); the eARC card comes from a device-tree overlay so it is present from boot,
+# unlike the TOSLINK Pico it replaces.
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+# Stage 2: source_router stops/starts this on every TV format change. Scrubbing a 5.1
+# movie can cross compressed<->LPCM boundaries several times in 10s; without this,
+# systemd's default start rate-limit (5/10s) would refuse a legitimate start and
+# strand the TV.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# System-mode PipeWire socket for pw-cat (must match pipewire.service / source-router.service).
+Environment=XDG_RUNTIME_DIR=/run/pipewire
+Environment=PIPEWIRE_REMOTE=pipewire-0
+ExecStart=/opt/vibesbox-src/scripts/earc-bitstream-bridge.sh %i
+# Bridge-down = TV-source-dead, so self-heal fast. SIGKILL + control-group teardown
+# kills the whole arecord|python|ffmpeg|pw-cat pipeline on stop (arecord blocks
+# indefinitely on an I2S slave capture with no bit clock, so it cannot be relied on
+# to notice a stop by itself).
+Restart=on-failure
+RestartSec=2
+User=root
+KillSignal=SIGKILL
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

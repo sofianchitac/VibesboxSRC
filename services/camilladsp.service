@@ -1,0 +1,28 @@
+[Unit]
+Description=CamillaDSP Audio Processing Engine (v2 native PipeWire backend)
+# v2: CamillaDSP uses its NATIVE PipeWire backend (dsp_6ch.yml: type: PipeWire),
+# so system-mode PipeWire must be up before it starts and it needs the PW socket env.
+# It boots with -w (no config); source_router.py pushes dsp_6ch.yml on connect, which
+# is what creates the dsp-in/dsp-out PipeWire nodes.
+After=alsa-loopback.service usb-gadget.service sound.target pipewire.service wireplumber.service
+Requires=alsa-loopback.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+# PipeWire socket env for the native backend (system-mode PipeWire; matches pipewire.service
+# / source-router.service).
+Environment=XDG_RUNTIME_DIR=/run/pipewire
+Environment=PIPEWIRE_REMOTE=pipewire-0
+# -p 1234         WebSocket control port
+# -a 0.0.0.0      Listen on all interfaces (required for pyCamillaDSP and UI)
+# -w              Wait (no boot config); source_router.py pushes dsp_6ch.yml on connect
+ExecStart=/usr/local/bin/camilladsp -p 1234 -a 0.0.0.0 -w -o /opt/vibesbox-src/state/camilladsp.log
+Restart=always
+RestartSec=3
+User=root
+TimeoutStopSec=10
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

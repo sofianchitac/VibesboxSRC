@@ -1,0 +1,8 @@
+[terminal]
+vt = 1
+
+[default_session]
+# No compositor: kiosk.sh execs the QML kiosk straight onto KMS/DRM via Qt
+# eglfs (sway retired 2026-07-22). greetd stays as the vt1 session manager.
+command = "/opt/vibesbox-src/scripts/kiosk.sh"
+user = "__USER__"

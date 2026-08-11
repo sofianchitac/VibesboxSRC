@@ -1,0 +1,12 @@
+<?xml version='1.0' standalone='yes'?>
+<extensions>
+  <name>Vibesbox Transcode</name>
+  <description>ffmpeg-based decoding for Tidal MP4 streams that faad cannot handle</description>
+  <creator>Vibesbox</creator>
+  <version>1.0.0</version>
+  <module>Plugins::VibesboxTranscode::Plugin</module>
+  <targetApplication>
+    <minVersion>8.3.0</minVersion>
+    <maxVersion>*</maxVersion>
+  </targetApplication>
+</extensions>

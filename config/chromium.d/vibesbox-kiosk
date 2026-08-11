@@ -1,0 +1,14 @@
+# Vibesbox SRC — kiosk overrides
+# Neutralize Google service keys — this is a local kiosk, not a Google account device
+export GOOGLE_API_KEY=""
+export GOOGLE_DEFAULT_CLIENT_ID=""
+export GOOGLE_DEFAULT_CLIENT_SECRET=""
+
+# Disable all Google network services (GCM, sync, metrics, push)
+export CHROMIUM_FLAGS="$CHROMIUM_FLAGS \
+  --disable-background-networking \
+  --disable-sync \
+  --disable-features=PushMessaging \
+  --disable-metrics-reporting \
+  --no-first-run \
+  --user-data-dir=/tmp/chromium-kiosk"
