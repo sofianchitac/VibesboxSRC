@@ -9,9 +9,10 @@
 }
 
 /* ── Design tokens ─────────────────────────────────────────────────────────
- * One palette, three surfaces: this file, ui-qml/Theme.qml (SRC touchscreen)
- * and VibesboxKiosk/Themes/Tokens.xaml (DSP touchscreen). Every value below
- * exists in both of those — no colour lives only on the remote.
+ * One palette, four surfaces: this file, ui-qml/Theme.qml (SRC touchscreen),
+ * VibesboxKiosk/Themes/Tokens.xaml (DSP touchscreen) and VibesboxNode's
+ * ui/index.html. Every value below exists in those — no colour lives only on
+ * the remote.
  */
 :root {
     --bg:            #000000;   /* Theme.bg           / BgPrimary   */
