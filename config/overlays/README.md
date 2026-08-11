@@ -96,11 +96,10 @@ a channel map off an I2S slave DAI. Suppressed by the eARC block in
 `config/wireplumber/wireplumber.conf.d/52-vibesbox-sources.conf`, same treatment
 as USB and TOSLINK.
 
-> **Note on `../tools/`:** the bench scripts referenced below (`earc_probe.py`,
-> `earc_analyze.py`, `earc_61937_extract.py`) live outside this repository and are not
-> published. They are one-shot diagnostics, not part of the running system — what they do
-> is described where each is mentioned, and the important findings they produced are
-> recorded here. Open an issue if you want them; they are small and easily shared.
+> **Note on `../tools/`:** the bench scripts referenced below are in
+> [`tools/`](../../tools/) at the repository root — one-shot diagnostics, not part of the
+> running system, so `install.sh` does not deploy them. Copy one to the Pi when you need
+> it. See [`tools/README.md`](../../tools/README.md).
 
 ### Probing what the TV actually sends
 

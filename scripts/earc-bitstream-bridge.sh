@@ -108,16 +108,19 @@ IN_DEVICE="hw:${CARD},0"
 EXTRACT=/opt/vibesbox-src/scripts/tv_ac3_extract.py
 TRIM=/opt/vibesbox-src/scripts/pcm_backlog_trim.py
 
-# DECODER: ffmpeg (default) | gst. Flip with the systemd drop-in
+# DECODER: gst (default) | ffmpeg. Override with the systemd drop-in
 # /etc/systemd/system/earc-bitstream-bridge@.service.d/decoder.conf, then restart the
 # bridge (source_router restarts it on the next TV format change anyway).
+#
+# gst has been the live decoder since 2026-08-01 for the latency win below. ffmpeg is
+# the fallback and the only arm with DRC control — see warning 1.
 #
 # GStreamer measured 2026-07-31 (Stage 12) as a drop-in for ffmpeg in
 # ../tools/earc_latency_marker.py, decoder as the only variable: DD+ 61.6 -> 40.1ms
 # (-21.9), AC-3 68.5 -> 71.6 (+2.1). The win is real and its mechanism is understood —
 # ffmpeg holds ONE EXTRA DECODE FRAME (gst's t1-t0 leads by ~35ms ~= one 32ms frame).
 #
-# ⚠⚠ IT IS NOT A FREE SWAP — read before enabling:
+# ⚠⚠ IT IS NOT A FREE SWAP — the trade accepted in choosing it as the default:
 #
 #  1. NO DRC CONTROL. `gst-inspect-1.0 avdec_ac3` exposes only max-errors / min-latency /
 #     plc / tolerance — there is NO `drc_scale` equivalent, and libavcodec's default is
@@ -141,7 +144,7 @@ TRIM=/opt/vibesbox-src/scripts/pcm_backlog_trim.py
 #     (LFE) must show an order of magnitude less HF energy than the rest.
 #  3. ⛔ It CANNOT touch the ~230ms multichannel lipsync gap — Stage 14 placed that
 #     upstream of arecord. This buys ~22ms on DD+, nothing else.
-DECODER="${DECODER:-ffmpeg}"
+DECODER="${DECODER:-gst}"
 case "$FORMAT" in
     eac3) GST_PARSE=ac3parse; GST_DEC=avdec_eac3 ;;
     ac3)  GST_PARSE=ac3parse; GST_DEC=avdec_ac3  ;;

@@ -66,6 +66,7 @@ alone and are probably why you are here:
 | A PipeWire graph pinned to one rate that sums arbitrary sources | [`config/pipewire/`](config/pipewire/) and [`config/wireplumber/`](config/wireplumber/) |
 | Decoding a DD+/DD/DTS bitstream captured as PCM | [`scripts/earc-bitstream-bridge.sh`](scripts/) and `tv_ac3_extract.py` |
 | Multichannel audio over Ethernet with drift correction | [`scripts/ndi_transmitter.py`](scripts/) |
+| Working out what an HDMI/eARC source is actually sending | [`tools/`](tools/) — probes that report measured rate, live lanes, and LPCM vs IEC 61937 with the codec name |
 
 Every directory has a README explaining what it is and why it exists.
 [`scripts/`](scripts/) is the best place to start reading code — `source_router.py` is the
