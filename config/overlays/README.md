@@ -177,6 +177,34 @@ multichannel LPCM now reaches the sum bus in full. Always 6ch with no
 channel-count detection — a 2.0 source leaves the unused lanes digitally silent,
 so stereo simply sits in FL/FR.
 
+### Rate-following, 2026-08-12 — the TV no longer has to be pinned to 48 kHz
+
+A slave DAI has no rate autodetect and the requested open rate is only bookkeeping,
+so the bridge **measures** the rate from frame delivery: once at startup, then every
+second in the watchdog. Measured live on hardware at ±0.01%:
+
+```
+measured 48003 Hz -> 48000 Hz
+measured 96011 Hz -> 96000 Hz
+```
+
+All six standard rates (44.1k–192k) open fine on this DAI — verified by opening each
+one. A measurement that snaps to no standard rate is refused rather than resampled
+against, because a bad estimate means wrong pitch, which is far less discoverable
+than silence. `source_router` publishes the offending rate as `tv_rate_unsupported`
+in its WS state so the UI can distinguish "unsupported rate" from "TV off" — before
+this they were indistinguishable, and the silence looked like a fault.
+
+Note that in practice a rate change re-handshakes the eARC link and the capture takes
+an ALSA I/O error first, which stops the bridge in ~1 s — faster than the 3-window
+watchdog. Measured 48k→96k live: I/O error at 23:23:14, restarted and re-measured at
+96 kHz by 23:23:16, 0 restarts afterwards. The watchdog is the backstop for a source
+that changes rate *without* dropping the clock; its debounce is unit-tested
+(`cargo test`), including that a stall storm never accumulates into a rate change.
+
+Rate also sets resampler group delay (`quality / input_rate`), so a 96 kHz source is
+*lower* latency than 48 kHz: `rs~19.6ms` vs `rs~39.1ms`, bridge total ~62 ms vs ~83 ms.
+
 ★ **The C9's own webOS player cannot source this at all** — the LPCM-passthrough
 firmware feature applies to HDMI inputs only. And `Digital Sound Out = PCM` forces
 a stereo downmix; `Pass Through` is what relays multichannel intact. Together

@@ -85,10 +85,132 @@ struct SourceCfg {
     // None => USB gadget: native rate via amixer numid=8 (Capture Rate).
     // Some(path) => snd-aloop writer: native rate via /proc hw_params `rate:`.
     hw_params: Option<&'static str>,
-    // Some(r) => rate is fixed in hardware (e.g. TOSLINK Pico UAC2 locked at 48kHz);
-    // skip the rate-detection retry loop and disable the watchdog rate-change check.
-    // Disconnect detected via /proc/asound/<card> directory existence.
-    fixed_rate: Option<u32>,
+    // true => I2S SLAVE capture (the eARC tap). The rate cannot be READ from anywhere —
+    // there is no amixer control and no hw_params writer — so it is MEASURED from frame
+    // delivery, once at startup and then every watchdog tick (see measure_rate/snap_rate).
+    // Also selects the disconnect check: /proc/asound/<card> directory existence, since
+    // there is no hw_params to consult and the DT platform card never disappears.
+    slave_measured: bool,
+}
+
+// The rates an eARC/HDMI LPCM source can present. Adjacent entries are >=8.1% apart, so a
+// +/-4% snap window is unambiguous and comfortably wider than the measurement error.
+const STD_RATES: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+const RATE_TOLERANCE: f64 = 0.04;
+
+// How long to measure at startup. Both the frame count and the elapsed time come from the
+// SAME completed reads, so there is no period-quantisation error and this need not be long.
+const MEASURE_WINDOW: Duration = Duration::from_millis(500);
+
+// Consecutive 1s watchdog windows that must agree ON THE SAME snapped rate before we treat
+// it as a real rate change. A stall or a ring overflow makes one window read low, which is
+// indistinguishable from a downward rate change at 1 Hz sampling — requiring agreement on a
+// specific target (not merely "not the current rate") is what stops a stall storm from
+// walking the bridge onto a wrong rate and reintroducing wrong-pitch playback.
+const RATE_CHANGE_WINDOWS: u32 = 3;
+
+/// Snap a measured frame rate onto a standard rate. None when it is not within
+/// RATE_TOLERANCE of any of them — a stall, a startup transient, or a genuinely exotic
+/// rate. All three mean "do not resample against this", so None is never a rate change.
+fn snap_rate(measured: f64) -> Option<u32> {
+    if !measured.is_finite() || measured <= 0.0 {
+        return None;
+    }
+    STD_RATES
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            let da = (measured - *a as f64).abs();
+            let db = (measured - *b as f64).abs();
+            da.partial_cmp(&db).unwrap()
+        })
+        .filter(|r| (measured / *r as f64 - 1.0).abs() <= RATE_TOLERANCE)
+}
+
+/// Debounce for the slave-rate watchdog.
+///
+/// Fires only when RATE_CHANGE_WINDOWS consecutive windows agree on the SAME snapped rate,
+/// and that rate differs from the one we are running at. `None` (stall, clock gone, garbage)
+/// RESETS the evidence rather than counting toward a change — that asymmetry is the whole
+/// point: at 1 Hz sampling a stalled window is indistinguishable from a slower rate, so
+/// counting them would let a flapping link walk the bridge onto a wrong rate, which is the
+/// wrong-pitch failure this design exists to prevent.
+///
+/// In practice an eARC rate change re-handshakes the link and the capture takes an ALSA I/O
+/// error first, which stops the bridge faster than this can (~1 s vs 3 s). This is the
+/// backstop for a source that changes rate WITHOUT dropping the clock.
+struct RateChangeDebounce {
+    current: u32,
+    candidate: Option<u32>,
+    agreed: u32,
+}
+
+impl RateChangeDebounce {
+    fn new(current: u32) -> Self {
+        Self { current, candidate: None, agreed: 0 }
+    }
+
+    /// Feed one window's snapped measurement. Some(rate) => change confirmed.
+    fn observe(&mut self, snapped: Option<u32>) -> Option<u32> {
+        match snapped {
+            Some(r) if r != self.current => {
+                if self.candidate == Some(r) {
+                    self.agreed += 1;
+                } else {
+                    self.candidate = Some(r);
+                    self.agreed = 1;
+                }
+                if self.agreed >= RATE_CHANGE_WINDOWS {
+                    return Some(r);
+                }
+            }
+            _ => {
+                // Either the expected rate, or no usable measurement. Both clear the run.
+                self.candidate = None;
+                self.agreed = 0;
+            }
+        }
+        None
+    }
+}
+
+/// Measure an I2S slave capture's true rate from how fast it delivers frames.
+///
+/// The requested open rate is bookkeeping for a slave DAI — the hardware clocks at whatever
+/// BCLK the transmitter provides — so we open at a nominal 48k purely to get a handle, and
+/// derive the real rate from delivery. (Proven: source_router's probe opens at 48k and a
+/// 192 kHz stream returns the requested 48000 frames in ~0.25 s.)
+///
+/// ★ The first read is DISCARDED. It carries the ALSA open plus the driver's first period,
+/// which biases the estimate LOW — that exact bias read 48 kHz as ~41.8 kHz (~13%) and made
+/// source_router refuse a healthy LPCM stream on 2026-07-28. Do not "simplify" it away.
+///
+/// Blocks if no bit clock is arriving, matching the capture loop's own semantics (TV off =
+/// the capture simply blocks). source_router only starts this bridge after a probe has
+/// already seen a clock.
+fn measure_rate(device: &str, channels: usize) -> Option<u32> {
+    let pcm = open_pcm(device, Direction::Capture, 48_000, channels as u32, CAP_PERIOD, CAP_BUFFER).ok()?;
+    let io = pcm.io_i32().ok()?;
+    let mut buf = vec![0i32; CAP_PERIOD as usize * channels];
+
+    io.readi(&mut buf).ok()?;                 // discard — see above
+
+    let t0 = Instant::now();
+    let mut frames = 0usize;
+    while t0.elapsed() < MEASURE_WINDOW {
+        frames += io.readi(&mut buf).ok()?;
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    drop(io);
+    drop(pcm);                                // free the device before the real open
+
+    let measured = frames as f64 / secs;
+    let snapped = snap_rate(measured);
+    match snapped {
+        Some(r) => eprintln!("ardftsrc-bridge: measured {measured:.0} Hz -> {r} Hz"),
+        None => eprintln!("ardftsrc-bridge: measured {measured:.0} Hz — not a standard rate"),
+    }
+    snapped
 }
 
 fn source_cfg(src: &str) -> Option<SourceCfg> {
@@ -107,7 +229,7 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
             // the relabel changed nothing downstream). The correction is done in REAPER.
             position: "[ FL FR FC LFE RL RR ]",
             hw_params: None,
-            fixed_rate: None,
+            slave_measured: false,
         }),
         "lyrion" => Some(SourceCfg {
             name: "lyrion",
@@ -116,7 +238,7 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
             in_device: "hw:Lyrion,1,0",
             position: "[ FL FR ]",
             hw_params: Some("/proc/asound/Lyrion/pcm0p/sub0/hw_params"),
-            fixed_rate: None,
+            slave_measured: false,
         }),
         "airplay" => Some(SourceCfg {
             name: "airplay",
@@ -125,7 +247,7 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
             in_device: "hw:AirPlay,1,0",
             position: "[ FL FR ]",
             hw_params: Some("/proc/asound/AirPlay/pcm0p/sub0/hw_params"),
-            fixed_rate: None,
+            slave_measured: false,
         }),
         // Tidal Connect: the (Dockerised, armhf) tidal_connect_application writes PCM
         // to the Tidal snd-aloop (hw:Tidal,0,0) via PortAudio/ALSA; we read the capture
@@ -141,7 +263,7 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
             in_device: "plughw:Tidal,1,0",
             position: "[ FL FR ]",
             hw_params: Some("/proc/asound/Tidal/pcm0p/sub0/hw_params"),
-            fixed_rate: None,
+            slave_measured: false,
         }),
         // TV via the eARC I2S tap (SiI9437 inside the Lindy 38368 -> RP1 i2s1 slave;
         // see config/overlays/). This REPLACED the TOSLINK optical path on 2026-07-28
@@ -165,11 +287,12 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
         // every quiet passage. Note the C9's own webOS player cannot source multichannel
         // LPCM at all; this path only carries it from an HDMI input in "Pass Through".
         //
-        // fixed_rate is a real constraint here, not just an optimisation: an I2S SLAVE
-        // capture has NO incoming-rate autodetect, and unlike the loopback sources there
-        // is no hw_params/numid8 to read one from. 48 kHz is what this source emits
-        // (measured); source_router's probe REFUSES to start this bridge if it measures
-        // anything else, rather than let a 44.1k stream play 8.8% fast.
+        // slave_measured is a real constraint, not an optimisation: an I2S SLAVE capture
+        // has NO incoming-rate autodetect, and unlike the loopback sources there is no
+        // hw_params/numid8 to read one from. So the rate is MEASURED off frame delivery —
+        // at startup, and every second by the watchdog, which restarts the bridge on a
+        // sustained change so the resampler is never fed a stale input rate. Before
+        // 2026-08-12 this was hardcoded 48 kHz and any other rate was simply refused.
         //
         // The eARC card is a device-tree platform card, so /proc/asound/eARC always
         // exists — the watchdog's disconnect check never fires. That matches the optical
@@ -183,7 +306,7 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
             in_device: "hw:eARC,0",
             position: "[ FL FR FC LFE RL RR ]",
             hw_params: None,
-            fixed_rate: Some(48_000),
+            slave_measured: true,
         }),
         _ => None,
     }
@@ -323,9 +446,19 @@ fn main() {
         }
     };
 
-    // Resolve native rate. Fixed-rate sources (e.g. TOSLINK Pico) skip the retry loop.
-    let rate = if let Some(r) = cfg.fixed_rate {
-        r
+    // Resolve native rate. The I2S slave (eARC tap) has nothing to read it from, so it is
+    // measured off frame delivery; every other source reads it from ALSA and retries while
+    // the writer settles.
+    let rate = if cfg.slave_measured {
+        match measure_rate(cfg.in_device, cfg.channels) {
+            Some(r) => r,
+            None => {
+                // Not a standard rate: refuse rather than resample against a bad estimate.
+                // source_router re-probes on its own interval and restarts us.
+                eprintln!("ardftsrc-bridge: {} rate not resolvable, aborting", cfg.card);
+                std::process::exit(2);
+            }
+        }
     } else {
         let mut detected = None;
         for _ in 0..50 {
@@ -407,6 +540,7 @@ fn main() {
     // LATENCY DIAGNOSTIC (temporary, 2026-06-10): capture-side snd_pcm_delay, updated by
     // the capture thread after each read, sampled by the process loop's periodic report.
     let cap_delay_frames = Arc::new(AtomicI64::new(-1));
+    let cap_frames = Arc::new(AtomicI64::new(0));
 
     // ── Capture thread: opens the input PCM itself (keeps the !Sync PCM thread-local),
     //    reads raw frames, converts to f64, pushes to the ring (drop on overflow). ──
@@ -414,6 +548,10 @@ fn main() {
     let cap_device = cfg.in_device.to_string();
     let cap_channels = channels;
     let cap_delay_w = cap_delay_frames.clone();
+    // Frames delivered since start — the watchdog's rate measurement reads this. Only ever
+    // incremented by successful reads, so a stalled or clockless capture simply stops
+    // advancing it, which reads as "no signal" rather than as a slower rate.
+    let cap_frames_w = cap_frames.clone();
     // Stage 2 (mid-stream auto-switch): only the TV source can receive an IEC 61937
     // bitstream (the TV switches stereo<->Dolby with content). When that happens
     // this DFT resampler would emit noise, so the capture thread scans for the burst
@@ -471,6 +609,7 @@ fn main() {
                     let _ = prod.push_slice(&f[..samples]);
                     // LATENCY DIAGNOSTIC: frames still queued device-side after this read.
                     cap_delay_w.store(pcm.delay().unwrap_or(-1), Ordering::Relaxed);
+                    cap_frames_w.fetch_add(n as i64, Ordering::Relaxed);
 
                     if cap_is_tv {
                         let mut found = false;
@@ -516,17 +655,22 @@ fn main() {
     let wd_hw = cfg.hw_params;
     let wd_card = cfg.card.to_string();
     let wd_name = cfg.name.to_string();
-    let wd_fixed_rate = cfg.fixed_rate;
+    let wd_slave = cfg.slave_measured;
+    let wd_frames = cap_frames.clone();
     let watchdog = thread::spawn(move || {
+        // Rolling mark for the slave rate measurement, and the debounce state.
+        let mut mark = (wd_frames.load(Ordering::Relaxed), Instant::now());
+        let mut debounce = RateChangeDebounce::new(rate);
+
         while wd_running.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_secs(1));
             if !wd_running.load(Ordering::Relaxed) {
                 break;
             }
-            // Fixed-rate sources: disconnect = card directory gone (no startup race, no
-            // hw_params "no setup" false-positive). Variable-rate sources: use the normal
-            // hw_params / amixer probe.
-            let disconnected = if wd_fixed_rate.is_some() {
+            // Slave sources: disconnect = card directory gone (no startup race, no
+            // hw_params "no setup" false-positive). Others: the normal hw_params / amixer
+            // probe.
+            let disconnected = if wd_slave {
                 !std::path::Path::new(&format!("/proc/asound/{wd_card}")).is_dir()
             } else {
                 source_disconnected(&wd_card, wd_hw)
@@ -536,14 +680,34 @@ fn main() {
                 wd_running.store(false, Ordering::SeqCst);
                 break;
             }
-            // Fixed-rate sources can't change rate — skip the check to avoid spurious restarts.
-            if wd_fixed_rate.is_none() {
-                if let Some(r) = detect_rate(&wd_card, wd_hw) {
-                    if r != rate {
-                        eprintln!("ardftsrc-bridge: {wd_name} rate changed {rate}->{r} — restarting");
-                        wd_running.store(false, Ordering::SeqCst);
-                        break;
-                    }
+
+            if wd_slave {
+                // Measure over the window just elapsed. Both terms come from the same
+                // interval, so a long scheduling delay cancels rather than skewing.
+                let now_frames = wd_frames.load(Ordering::Relaxed);
+                let now_t = Instant::now();
+                let df = (now_frames - mark.0) as f64;
+                let dt = now_t.duration_since(mark.1).as_secs_f64();
+                mark = (now_frames, now_t);
+
+                // snap_rate returns None for a stalled/clockless window (frames stop
+                // advancing), and None is deliberately NOT evidence of a rate change —
+                // it resets the debounce. This is what keeps a flapping eARC link, a bad
+                // HDMI cable, or a ring overflow from walking us onto a wrong rate.
+                let snapped = if dt > 0.0 { snap_rate(df / dt) } else { None };
+                if let Some(r) = debounce.observe(snapped) {
+                    eprintln!(
+                        "ardftsrc-bridge: {wd_name} rate changed {rate}->{r} \
+                         ({RATE_CHANGE_WINDOWS} consecutive windows) — restarting"
+                    );
+                    wd_running.store(false, Ordering::SeqCst);
+                    break;
+                }
+            } else if let Some(r) = detect_rate(&wd_card, wd_hw) {
+                if r != rate {
+                    eprintln!("ardftsrc-bridge: {wd_name} rate changed {rate}->{r} — restarting");
+                    wd_running.store(false, Ordering::SeqCst);
+                    break;
                 }
             }
         }
@@ -728,4 +892,84 @@ fn main() {
     // next ALSA-active poll, mirroring the v2 bash.
     drop((capture, watchdog));
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snap_accepts_standard_rates_and_small_error() {
+        assert_eq!(snap_rate(48_003.0), Some(48_000));   // real measurement, live hardware
+        assert_eq!(snap_rate(96_007.0), Some(96_000));   // real measurement, live hardware
+        assert_eq!(snap_rate(44_100.0), Some(44_100));
+        assert_eq!(snap_rate(192_000.0), Some(192_000));
+    }
+
+    #[test]
+    fn snap_rejects_non_standard_and_degenerate() {
+        // The documented startup-bias reading: timing from process spawn made 48k measure
+        // ~41.8k (~13% low) and source_router refused a healthy stream on 2026-07-28.
+        // It must land as "unknown", never snap onto 44.1k.
+        assert_eq!(snap_rate(41_769.0), None);
+        assert_eq!(snap_rate(0.0), None);
+        assert_eq!(snap_rate(-1.0), None);
+        assert_eq!(snap_rate(f64::NAN), None);
+        assert_eq!(snap_rate(60_000.0), None);
+    }
+
+    #[test]
+    fn debounce_ignores_steady_state() {
+        let mut d = RateChangeDebounce::new(48_000);
+        for _ in 0..20 {
+            assert_eq!(d.observe(Some(48_000)), None);
+        }
+    }
+
+    #[test]
+    fn debounce_fires_on_sustained_change() {
+        let mut d = RateChangeDebounce::new(48_000);
+        assert_eq!(d.observe(Some(96_000)), None);
+        assert_eq!(d.observe(Some(96_000)), None);
+        assert_eq!(d.observe(Some(96_000)), Some(96_000));   // 3rd agreeing window
+    }
+
+    #[test]
+    fn debounce_survives_a_stall_storm() {
+        // The failure this guards: a flapping link (bad HDMI cable) making windows read
+        // low/unusable must NEVER accumulate into a rate change.
+        let mut d = RateChangeDebounce::new(48_000);
+        for _ in 0..50 {
+            assert_eq!(d.observe(None), None);
+        }
+        // Interleaved stalls and a plausible-but-wrong snap also must not fire.
+        for _ in 0..20 {
+            assert_eq!(d.observe(Some(44_100)), None);
+            assert_eq!(d.observe(None), None);
+        }
+    }
+
+    #[test]
+    fn debounce_requires_the_same_target() {
+        // Two windows agreeing, then a DIFFERENT rate, must restart the count rather
+        // than count as a third — otherwise noise walks us onto an arbitrary rate.
+        let mut d = RateChangeDebounce::new(48_000);
+        assert_eq!(d.observe(Some(96_000)), None);
+        assert_eq!(d.observe(Some(96_000)), None);
+        assert_eq!(d.observe(Some(44_100)), None);   // resets to a run of 1
+        assert_eq!(d.observe(Some(96_000)), None);
+        assert_eq!(d.observe(Some(96_000)), None);
+        assert_eq!(d.observe(Some(96_000)), Some(96_000));
+    }
+
+    #[test]
+    fn debounce_resets_when_the_rate_returns() {
+        let mut d = RateChangeDebounce::new(48_000);
+        assert_eq!(d.observe(Some(96_000)), None);
+        assert_eq!(d.observe(Some(96_000)), None);
+        assert_eq!(d.observe(Some(48_000)), None);   // back to normal, evidence cleared
+        assert_eq!(d.observe(Some(96_000)), None);
+        assert_eq!(d.observe(Some(96_000)), None);
+        assert_eq!(d.observe(Some(96_000)), Some(96_000));
+    }
 }

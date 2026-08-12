@@ -209,6 +209,11 @@ class SourceRouter:
         self._earc_mode  = None
         self._earc_rate  = None
         self._earc_probe_after = 0.0        # monotonic gate, see EARC_PROBE_INTERVAL
+        # Set to the measured Hz when a probe found a live clock carrying LPCM at a rate we
+        # refuse. Without it the UI cannot tell "unsupported rate" from "TV off" — both
+        # leave _earc_mode None, so the source simply reads as absent and the silence looks
+        # like a fault rather than a decision.
+        self._earc_rate_unsupported = None
 
         self._reconcile_lock = asyncio.Lock()
 
@@ -584,8 +589,21 @@ class SourceRouter:
     # its timeout because an I2S slave with no bit clock delivers nothing.
     EARC_PROBE_INTERVAL = 5.0       # seconds between probes while no bridge is running
     EARC_PROBE_TIMEOUT  = 3.0       # give up on a capture that never returns (no clock)
-    EARC_LPCM_RATE      = 48000     # the only LPCM rate this tap is known to emit
+    # LPCM rates an eARC/HDMI source can present. Adjacent entries are >=8.1% apart, so the
+    # +/-4% snap window is unambiguous. Must stay in step with STD_RATES/RATE_TOLERANCE in
+    # ardftsrc-bridge-rs/src/main.rs — the bridge measures its own rate and would otherwise
+    # accept one this refuses (or the reverse).
+    EARC_STD_RATES      = (44100, 48000, 88200, 96000, 176400, 192000)
     EARC_RATE_TOLERANCE = 0.04      # +/-4%: separates 48k from 44.1k (8.1% apart)
+
+    def _snap_earc_rate(self, measured: int | None) -> int | None:
+        """Snap a measured tap rate onto a standard rate, or None if it is near none of
+        them. None means 'do not start a bridge' — a stalled probe and an exotic source
+        both land here, and both are cases where resampling would be wrong-pitch."""
+        if not measured or measured <= 0:
+            return None
+        best = min(self.EARC_STD_RATES, key=lambda r: abs(measured - r))
+        return best if abs(measured / best - 1.0) <= self.EARC_RATE_TOLERANCE else None
 
     def _tv_bridge_states(self) -> dict[str, bool]:
         """Which TV bridges are running, in ONE systemctl spawn for all units
@@ -748,27 +766,34 @@ class SourceRouter:
             if self._earc_mode is not None:
                 logging.info("TV: eARC clock gone -> source idle.")
             self._earc_mode, self._earc_rate = None, None
+            self._earc_rate_unsupported = None   # no clock at all, not a rate problem
             spec["channels"] = 2
             return
 
         if mode == "lpcm":
-            # An I2S slave capture cannot detect its own rate, and the LPCM bridge
-            # opens at a hardcoded 48k. Refuse rather than play a 44.1k stream 8.8%
-            # fast — silence with a log line is discoverable, wrong pitch is not.
-            if abs(rate / self.EARC_LPCM_RATE - 1.0) > self.EARC_RATE_TOLERANCE:
+            # The LPCM bridge measures the slave capture's rate itself and resamples from
+            # whatever it finds, so any standard rate is playable (2026-08-12; it used to
+            # be hardcoded 48k and everything else was refused). We still snap here to
+            # reject a measurement that is not near ANY standard rate — a stall or an
+            # exotic source — because resampling against a bad estimate is wrong pitch,
+            # and wrong pitch is far less discoverable than silence.
+            snapped = self._snap_earc_rate(rate)
+            if snapped is None:
                 logging.warning(
-                    f"TV: eARC LPCM measured {rate} Hz, expected {self.EARC_LPCM_RATE} "
-                    f"— refusing to start the bridge (it would play at the wrong pitch).")
+                    f"TV: eARC LPCM measured {rate} Hz — not a standard rate, refusing to "
+                    f"start the bridge (it would play at the wrong pitch).")
                 self._earc_mode, self._earc_rate = None, None
+                self._earc_rate_unsupported = rate     # surfaced in the WS state
                 spec["channels"] = 2
                 return
-            rate = self.EARC_LPCM_RATE      # snap off the read-boundary jitter
+            rate = snapped                  # snap off the read-boundary jitter
         else:
             # Bitstream: the elementary stream is 48k audio regardless of the 192k
             # (DD+) or 48k (AC-3/DTS) IEC 61937 carrier the bridge opens at.
             rate = 48000
 
         self._earc_mode, self._earc_rate = mode, rate
+        self._earc_rate_unsupported = None
         unit, channels = self.TV_BRIDGES[mode]
         spec["channels"] = channels         # reconcile links this many into dsp-in
         self._tv_bridge_maybe_running = True
@@ -1174,6 +1199,10 @@ class SourceRouter:
                         "sources_muted":     self.sources_muted,
                         "focused_source":    self.focused_source,
                         "input_rate":        self._ui_input_rate(),
+                        # Hz when the eARC tap is carrying LPCM at a rate we refuse, else
+                        # None. Lets the UI say "unsupported rate" instead of showing the
+                        # TV source as simply absent.
+                        "tv_rate_unsupported": self._earc_rate_unsupported,
                         "channels":          self.cdsp_state.get("channels"),
                         "resampler_type":    self.cdsp_state.get("resampler_type"),
                         "resampler_profile": self.cdsp_state.get("resampler_profile"),

@@ -25,9 +25,12 @@
 // merged CPU-codec constraints are CHANNELS [2 8], RATE [8000 384000],
 // FORMAT S16_LE/S24_LE/S32_LE — it does not narrow the DW DAI.
 //
-// Slave-mode caveat: there is NO incoming-rate autodetect — open the capture at
-// the rate the TV is set to (fix the TV to PCM 48 kHz). Frames are 64-bit
-// (2 x 32-bit slots); samples arrive 24-bit left-justified in S32.
+// Slave-mode caveat: there is NO incoming-rate autodetect. The requested open rate
+// is only bookkeeping — the hardware clocks at whatever BCLK the SiI9437 provides —
+// so the rate has to be MEASURED from frame delivery. ardftsrc-bridge does exactly
+// that (2026-08-12), at startup and every second thereafter, and all six standard
+// rates 44.1k-192k open fine on this DAI; the TV no longer has to be pinned to 48k.
+// Frames are 64-bit (2 x 32-bit slots); samples arrive 24-bit left-justified in S32.
 //
 // Compile + install (see config/overlays/README.md):
 //   dtc -@ -I dts -O dtb -o vibesbox-earc-tap.dtbo vibesbox-earc-tap-overlay.dts
