@@ -214,6 +214,11 @@ class SourceRouter:
         # leave _earc_mode None, so the source simply reads as absent and the silence looks
         # like a fault rather than a decision.
         self._earc_rate_unsupported = None
+        # Set when the tap carries a bitstream we can identify but not decode (HBR:
+        # DTS-HD/DTS:X or TrueHD). Distinct from _earc_rate_unsupported: that one means
+        # "LPCM at a rate we refuse", this one means "a codec with no decode path".
+        self._earc_unsupported_codec = None      # (data_type, label) from the probe
+        self._earc_codec_unsupported = None      # label currently being reported
 
         self._reconcile_lock = asyncio.Lock()
 
@@ -589,6 +594,18 @@ class SourceRouter:
     # its timeout because an I2S slave with no bit clock delivers nothing.
     EARC_PROBE_INTERVAL = 5.0       # seconds between probes while no bridge is running
     EARC_PROBE_TIMEOUT  = 3.0       # give up on a capture that never returns (no clock)
+    # IEC 61937 data types we can RECOGNISE but have no decode path for. Both are HBR
+    # (carried on a 192 kHz carrier, spread across all four I2S lanes). tv_ac3_extract
+    # deliberately excludes 0x11 from DATA_TYPES_DTS because it never traverses S/PDIF
+    # optical — true, but the eARC tap CAN see it, and "recognised, undecodable" is a far
+    # more useful answer than the rate-mismatch refusal these used to produce.
+    #
+    # Reaching either requires an HBR-capable source: a Blu-ray player, an Nvidia Shield,
+    # or Windows in exclusive mode. Neither macOS (VLC passthrough tops out at the DTS
+    # core / AC-3) nor a Pi (`vc4-hdmi` has no HBR) can emit one, so as of 2026-08-12
+    # this branch has never been reached on this system.
+    EARC_UNDECODABLE = {0x11: "DTS-HD / DTS:X", 0x16: "Dolby TrueHD / MAT"}
+
     # LPCM rates an eARC/HDMI source can present. Adjacent entries are >=8.1% apart, so the
     # +/-4% snap window is unambiguous. Must stay in step with STD_RATES/RATE_TOLERANCE in
     # ardftsrc-bridge-rs/src/main.rs — the bridge measures its own rate and would otherwise
@@ -715,6 +732,13 @@ class SourceRouter:
                 return "ac3", rate
             if data_type in tv_ac3_extract.DATA_TYPES_DTS:
                 return "dts", rate
+            if data_type in self.EARC_UNDECODABLE:
+                # Recognised, but there is no decode path. Returning a named mode instead
+                # of falling through to "lpcm" is the whole point: an HBR stream measures
+                # as a 192 kHz carrier, so the LPCM branch would refuse it as a RATE
+                # problem and report nothing about what actually arrived.
+                self._earc_unsupported_codec = (data_type, self.EARC_UNDECODABLE[data_type])
+                return "unsupported", rate
             start = pos + 4                 # non-audio burst — keep scanning
         return "lpcm", rate
 
@@ -767,6 +791,25 @@ class SourceRouter:
                 logging.info("TV: eARC clock gone -> source idle.")
             self._earc_mode, self._earc_rate = None, None
             self._earc_rate_unsupported = None   # no clock at all, not a rate problem
+            self._earc_codec_unsupported = None
+            spec["channels"] = 2
+            return
+
+        if mode == "unsupported":
+            # A real bitstream we can identify but cannot decode. _earc_mode MUST stay
+            # None — _alsa_active() reads it, and the TV source genuinely is not playing
+            # (no bridge, no node, no audio). The codec is carried separately so the log
+            # and the UI can say what arrived. Log on the rising edge only: the probe
+            # re-runs every EARC_PROBE_INTERVAL while no bridge is up, so a source parked
+            # on such a stream would otherwise fill the journal.
+            dt, label = self._earc_unsupported_codec
+            if self._earc_codec_unsupported != label:
+                logging.warning(
+                    f"TV: eARC {label} (IEC 61937 data type {dt:#04x}, HBR ~{rate} Hz "
+                    f"carrier) — no decode path, not starting a bridge.")
+            self._earc_mode, self._earc_rate = None, None
+            self._earc_codec_unsupported = label
+            self._earc_rate_unsupported = None      # a codec problem, not a rate problem
             spec["channels"] = 2
             return
 
@@ -794,6 +837,7 @@ class SourceRouter:
 
         self._earc_mode, self._earc_rate = mode, rate
         self._earc_rate_unsupported = None
+        self._earc_codec_unsupported = None
         unit, channels = self.TV_BRIDGES[mode]
         spec["channels"] = channels         # reconcile links this many into dsp-in
         self._tv_bridge_maybe_running = True
@@ -1203,6 +1247,10 @@ class SourceRouter:
                         # None. Lets the UI say "unsupported rate" instead of showing the
                         # TV source as simply absent.
                         "tv_rate_unsupported": self._earc_rate_unsupported,
+                        # Codec name when the tap carries an identifiable but undecodable
+                        # bitstream (HBR), else None. Pairs with tv_rate_unsupported so the
+                        # UI can say WHY the TV source is silent rather than just absent.
+                        "tv_codec_unsupported": self._earc_codec_unsupported,
                         "channels":          self.cdsp_state.get("channels"),
                         "resampler_type":    self.cdsp_state.get("resampler_type"),
                         "resampler_profile": self.cdsp_state.get("resampler_profile"),
