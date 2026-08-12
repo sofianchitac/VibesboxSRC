@@ -45,9 +45,13 @@
 # exactly the 5.1 bed we want. Only TrueHD/MAT (0x16, local media players) is out of
 # scope; it is HBR and would need its own handling.
 #
-# ⚠ DTS UNVERIFIED on hardware: the TV re-encodes everything to Dolby, so DTS only
-#   reaches this path if a DTS-bitstreaming source is wired in directly. The IEC 61937
-#   encapsulation is identical, so it SHOULD generalize, but it is not confirmed.
+# ✔ DTS VERIFIED on hardware, twice, and the old "the TV re-encodes everything to Dolby"
+#   premise was simply wrong — DTS reaches this path fine:
+#     2026-07-30  Chromecast w/ Google TV: 937/937 bursts Pc=0x0B, 1.509 Mbps, clean 5.1
+#     2026-08-13  VLC on a Mac over HDMI -> C9 Pass Through: dcaparse/avdec_dca, 0 errors
+#   Both delivered the DTS **core** only (0x0B, 48 kHz carrier). DTS:X / DTS-HD MA need
+#   0x11 on a 192 kHz HBR carrier and have never arrived — neither source can emit HBR.
+#   source_router now names 0x11 explicitly rather than mis-refusing it as a rate problem.
 #
 # ⚠ The 2026-07-28 PipeWire-SRC move was measured on @eac3 only. @ac3 and @dts inherit it
 #   untested, but the arithmetic transfers exactly: the elementary stream is 48k for every

@@ -35,8 +35,10 @@ tv-ac3-bridge.sh, `dts` in tv-dts-bridge.sh) so only that codec's bursts are emi
 into the matching ffmpeg decoder — a mid-stream AC-3<->DTS change then starves the
 extractor and the no-burst timeout exits for a source_router re-probe, instead of
 feeding the wrong decoder forever. Non-audio bursts (NULL/pause) are skipped.
-(DTS path UNVERIFIED on hardware — the current TV re-encodes to Dolby Digital; see
-tv-dts-bridge.sh.)
+(DTS path VERIFIED on hardware 2026-07-30 and 2026-08-13 — the old note here claimed the
+TV re-encodes everything to Dolby, which is wrong. Both runs carried the DTS **core**
+only, Pc=0x0B on a 48 kHz carrier; DTS-HD/DTS:X is 0x11 on a 192 kHz HBR carrier and is
+deliberately excluded from DATA_TYPES_DTS below.)
 """
 
 import sys

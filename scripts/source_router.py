@@ -585,7 +585,7 @@ class SourceRouter:
         "lpcm": ("ardftsrc-bridge@tv.service", 6),          # DFT resampler @48k
         "eac3": ("earc-bitstream-bridge@eac3.service", 6),  # DD+ / streaming Atmos @192k
         "ac3":  ("earc-bitstream-bridge@ac3.service", 6),   # legacy DD @48k
-        "dts":  ("earc-bitstream-bridge@dts.service", 6),   # UNVERIFIED (TV re-encodes)
+        "dts":  ("earc-bitstream-bridge@dts.service", 6),   # legacy DTS core @48k
     }
 
     # eARC probe pacing. The probe is a ~1s capture, so it must not run every 2 Hz tick.
