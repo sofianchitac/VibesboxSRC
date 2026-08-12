@@ -150,8 +150,20 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
         // copies at different latencies. The optical rollback (`tv-optical`) was
         // retired 2026-08-03 — archived to vibesbox-backups/.
         //
-        // LPCM mode only: stereo on lane SD0 at 48 kHz. `hw:` (not plughw:) — the tap
-        // is natively S32 24-bit left-justified, so no conversion layer is wanted.
+        // LPCM mode, 6ch since 2026-08-12 (was 2ch = lane SD0 only). `hw:` (not plughw:)
+        // — the tap is natively S32 24-bit left-justified, so no conversion layer is wanted.
+        //
+        // A 6ch open reads lanes SD0-SD2. Channel order is passed through AS CAPTURED —
+        // do NOT add a remap here. All channel mapping lives in REAPER, exactly as for the
+        // USB source above. Verified end to end 2026-08-12: multichannel LPCM arrives in
+        // REAPER identically to USB and the bitstream bridge.
+        //
+        // Always 6ch, with no stereo/multichannel detection: when the TV sends 2.0 the
+        // unused lanes read EXACTLY zero (verified 2026-07-27), so stereo simply sits in
+        // FL/FR with silent rears — the same contract as the 6ch USB source, and it matches
+        // the system's no-Pi-side-upmix rule. Detecting channel count instead would flap on
+        // every quiet passage. Note the C9's own webOS player cannot source multichannel
+        // LPCM at all; this path only carries it from an HDMI input in "Pass Through".
         //
         // fixed_rate is a real constraint here, not just an optimisation: an I2S SLAVE
         // capture has NO incoming-rate autodetect, and unlike the loopback sources there
@@ -167,9 +179,9 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
         "tv" => Some(SourceCfg {
             name: "tv",
             card: "eARC",
-            channels: 2,
+            channels: 6,
             in_device: "hw:eARC,0",
-            position: "[ FL FR ]",
+            position: "[ FL FR FC LFE RL RR ]",
             hw_params: None,
             fixed_rate: Some(48_000),
         }),

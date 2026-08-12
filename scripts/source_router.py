@@ -568,7 +568,11 @@ class SourceRouter:
     # RATES, and different downstream channel counts, so we probe the tap and pick one.
     # Keys match _probe_earc()'s returned mode.
     TV_BRIDGES = {                                  # mode -> (unit, channels)
-        "lpcm": ("ardftsrc-bridge@tv.service", 2),          # DFT resampler @48k
+        # 6ch since 2026-08-12: the eARC tap's 4 data lanes carry up to 8ch LPCM and a 6ch
+        # open reads SD0-SD2. Stereo content still just sits in FL/FR — the unused lanes are
+        # digitally silent — so this is 6ch unconditionally, with no channel-count detection
+        # to flap on quiet passages. Matches the 6ch USB source's contract.
+        "lpcm": ("ardftsrc-bridge@tv.service", 6),          # DFT resampler @48k
         "eac3": ("earc-bitstream-bridge@eac3.service", 6),  # DD+ / streaming Atmos @192k
         "ac3":  ("earc-bitstream-bridge@ac3.service", 6),   # legacy DD @48k
         "dts":  ("earc-bitstream-bridge@dts.service", 6),   # UNVERIFIED (TV re-encodes)

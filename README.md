@@ -40,7 +40,7 @@ design, not a workaround.
  source_router.py — activity detect · bridge lifecycle · PipeWire routing · per-source
  mute · Bluetooth mgmt · :8080 WebSocket ──▶ Touchscreen UI (800×480)
 
- * TV: LPCM stereo via ardftsrc, or IEC 61937 DD+/DD/DTS via the eARC decode bridge (6ch)
+ * TV: LPCM up to 5.1 via ardftsrc (6ch), or IEC 61937 DD+/DD/DTS via the eARC decode bridge (6ch)
 ```
 
 Two things about that diagram are worth stating explicitly, because they surprise people:

@@ -76,8 +76,8 @@ ones for a fragment that modifies existing nodes).
 | 3–8 | SD1–SD3 | silent | silent | exactly zero — TV was sending 2.0 |
 
 Low byte of every S32 sample was `0x00`, confirming **24-bit left-justified in
-S32 slots** as predicted. Lane→channel mapping beyond SD0 is still UNMEASURED —
-it needs the TV actually sending 5.1 LPCM over eARC.
+S32 slots** as predicted. (Lane→channel mapping beyond SD0 was unmeasured at this
+point — **measured 2026-08-12**, see below.)
 
 ### Side effect: the eARC card takes an ALSA index at boot
 
@@ -151,24 +151,42 @@ IEC 61937 places Pa in subframe A and Pb in subframe B. `earc_probe.py` matches
 independent captures. Inverted WS polarity would have landed those swapped and
 the scan would have failed. **Channel 1 = left, confirmed by known-identity
 signal.** The lane-map question is moot on the bitstream path (everything is 2ch
-on SD0; channel order comes from the ffmpeg decoder) — the note below is kept
-only for a future multichannel-LPCM source.
+on SD0; channel order comes from the ffmpeg decoder).
+
+### ★ All four lanes VERIFIED 2026-08-12 — SD1–SD3 are no longer untested
+
+Chain: **Mac → HDMI input → LG C9 (`Digital Sound Out = Pass Through`) → eARC →
+Lindy → tap.** 7.1 LPCM 48 kHz, a distinct tone per channel. All eight channels
+came back live at an identical −21.1 dBFS — so SD1, SD2 and SD3 all carry real
+audio, and the 2026-07-27 "silent" reading was purely the absence of a
+multichannel source.
+
+| capture ch | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| lane | SD0 | SD0 | SD1 | SD1 | SD2 | SD2 | SD3 | SD3 |
+| channel | FL | FR | SR | SL | FC | LFE | BL | BR |
+
+A **6-channel open reads exactly SD0–SD2**, and a 2ch open reads SD0 — lane
+interleave is sequential. That order is what this particular source sent; the
+sending device's own channel configuration determines it. Recorded as a
+measurement only: **channel mapping is not corrected on the Pi, REAPER handles
+it** (same contract as the USB source).
+
+`ardftsrc-bridge@tv` opens **6ch** as of 2026-08-12 (was 2ch = SD0 only), so
+multichannel LPCM now reaches the sum bus in full. Always 6ch with no
+channel-count detection — a 2.0 source leaves the unused lanes digitally silent,
+so stereo simply sits in FL/FR.
+
+★ **The C9's own webOS player cannot source this at all** — the LPCM-passthrough
+firmware feature applies to HDMI inputs only. And `Digital Sound Out = PCM` forces
+a stereo downmix; `Pass Through` is what relays multichannel intact. Together
+those explain the "all 8 lanes digital zero" row in the sweep above.
 
 ### Remaining bring-up steps
 
-1. Put the TV on genuine multichannel LPCM (not DD/DD+ passthrough) and re-run
-   the 8ch capture, then analyse it with `../tools/earc_analyze.py` (peak / RMS /
-   low-byte / lag-0 correlation matrix, stdlib only — the Pi has neither `sox`
-   nor `numpy`) to read off which lane carries which channel. `install.sh` does
-   not deploy `../tools/`, so copy it over first:
-   `scp ../tools/earc_analyze.py vibesbox@vibesbox-src.local:/tmp/ && ssh vibesbox@vibesbox-src.local 'python3 /tmp/earc_analyze.py /tmp/earc.wav 8'`
-2. If eARC's order differs from `FL,FR,RL,RR,FC,LFE`, normalise to that on the Pi
-   side — USB (iPad) and TV optical both already land on it so REAPER's single
-   remap serves all three. Do not add a second REAPER remap. ffmpeg decodes
-   E-AC-3 to `FL,FR,FC,LFE,SL,SR`, so the bitstream path needs this remap too.
-4. If `arecord` blocks forever: no BCLK is arriving — the extractor isn't in
+1. If `arecord` blocks forever: no BCLK is arriving — the extractor isn't in
    I2S8 LPCM mode, or the tap wiring is off. Scope GPIO 18 first.
-5. Compressed passthrough (DD/DD+) appears as IEC 61937 bursts, which the
+2. Compressed passthrough (DD/DD+) appears as IEC 61937 bursts, which the
    existing `tv_ac3_extract.py` chain already knows how to classify.
 
 ### End-to-end decode PROVEN 2026-07-28

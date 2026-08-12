@@ -36,7 +36,22 @@
 //
 // ★ VALIDATED ON HARDWARE 2026-07-27 (Pi 5, kernel 6.18.34+rpt-rpi-v8): card
 // "eARC" enumerates, 8ch/S32_LE/48kHz capture returns live audio, no xruns.
-// Lane->channel map beyond SD0 still unmeasured (needs 5.1 LPCM from the TV).
+//
+// ★ LANE MAP MEASURED 2026-08-12 (Mac -> HDMI in -> LG C9 "Pass Through" -> eARC;
+// 7.1 LPCM 48kHz, per-channel tones, all 8 at an identical -21.1 dBFS):
+//
+//   capture ch  0    1    2    3    4    5    6    7
+//   lane        SD0  SD0  SD1  SD1  SD2  SD2  SD3  SD3
+//   channel     FL   FR   SR   SL   FC   LFE  BL   BR
+//
+// The order above is what this Mac/C9 combination sent; the sending device's own
+// channel configuration determines it. Recorded here as a measurement only —
+// channel mapping is not corrected on the Pi, it is handled in REAPER.
+//
+// Note the TV's own webOS player CANNOT source this — the C9's LPCM passthrough
+// applies to HDMI inputs only, and Digital Sound Out must be "Pass Through"
+// ("PCM" forces a stereo downmix). ch->lane is inferred from sequential lane
+// interleave; ch->tone and tone->channel are both measured.
 /dts-v1/;
 /plugin/;
 
