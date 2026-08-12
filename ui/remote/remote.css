@@ -77,7 +77,7 @@ html, body {
 }
 .remote-header h1 {
     margin: 0;
-    color: var(--grey);
+    color: var(--orange);
 }
 
 /* ── Layout ───────────────────────────────────────────────────────────────
