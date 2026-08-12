@@ -24,6 +24,12 @@ Restart=on-failure
 RestartSec=2
 User=root
 KillSignal=SIGKILL
+# SIGKILL is the STOP signal (above), so an ordinary `systemctl stop` — which is how
+# source_router retires an idle source — leaves the unit in `Result: signal` = failed.
+# Without this line every clean stop shows up in `systemctl --failed`, and a health
+# check that is always dirty hides the real failures it exists to surface. Counted 8
+# such false entries for @tv and 5 for @lyrion before this was added (2026-08-13).
+SuccessExitStatus=SIGKILL
 TimeoutStopSec=5
 
 [Install]

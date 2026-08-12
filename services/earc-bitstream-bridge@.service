@@ -27,6 +27,10 @@ Restart=on-failure
 RestartSec=2
 User=root
 KillSignal=SIGKILL
+# See the matching note in ardftsrc-bridge@.service: SIGKILL is the stop signal, so
+# without this a normal `systemctl stop` (how source_router switches TV formats) is
+# recorded as failed and pollutes `systemctl --failed`.
+SuccessExitStatus=SIGKILL
 TimeoutStopSec=5
 
 [Install]
