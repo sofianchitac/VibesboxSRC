@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Remote-only wordmark: the VIBESBOX letterforms from ui/vibesbox-logo-grey.svg
+<!-- Remote-only wordmark: the VIBESBOX letterforms from ui/vibesbox-src-logo-grey.svg
      with the "SRC" group dropped and the viewBox tightened to the X glyph's right
-     edge (186.4). The shared ui/vibesbox-logo-grey.svg is unchanged — the QML
+     edge (186.4). The shared ui/vibesbox-src-logo-grey.svg is unchanged — the QML
      kiosk still renders the full VIBESBOX SRC lockup. -->
 <svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 186.4 23.1" fill="#8b796b">
   <path d="M23.2.4l-10.1,22.4h-3L0,.4h3.3l8.5,18.8L20.1.4h3.1Z"/>

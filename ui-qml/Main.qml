@@ -130,7 +130,7 @@ Window {
                         anchors.centerIn: parent
                         width: parent.width
                         fillMode: Image.PreserveAspectFit
-                        source: "../ui/vibesbox-logo-grey.svg"
+                        source: "../ui/vibesbox-src-logo-grey.svg"
                         sourceSize.width: width * 2
                         opacity: Theme.colorMode ? 0 : 1
                         Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.InOutSine } }

@@ -32,7 +32,7 @@ working.
 
 ## Shared assets
 
-`vibesbox-logo-grey.svg`, `splashscreen.png` and `Instrument_Sans/` are referenced by the
+`vibesbox-src-logo-grey.svg`, `splashscreen.png` and `Instrument_Sans/` are referenced by the
 remote dashboard and the boot splash. Instrument Sans is under the SIL Open Font License;
 `OFL.txt` sits alongside it.
 
