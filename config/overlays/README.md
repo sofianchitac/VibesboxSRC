@@ -173,9 +173,25 @@ measurement only: **channel mapping is not corrected on the Pi, REAPER handles
 it** (same contract as the USB source).
 
 `ardftsrc-bridge@tv` opens **6ch** as of 2026-08-12 (was 2ch = SD0 only), so
-multichannel LPCM now reaches the sum bus in full. Always 6ch with no
-channel-count detection — a 2.0 source leaves the unused lanes digitally silent,
-so stereo simply sits in FL/FR.
+multichannel LPCM now reaches the sum bus. Always 6ch with no channel-count
+detection — a 2.0 source leaves the unused lanes digitally silent, so stereo
+simply sits in FL/FR.
+
+★ **The tap does 8ch; we deliberately take 6.** All four lanes were verified
+carrying discrete audio, so 7.1 genuinely arrives at `hw:eARC,0` — the 6-channel
+limit is entirely **downstream**, in three places at once:
+
+| Stage | Width |
+|---|---|
+| `camilladsp/dsp_6ch.yml` | capture 6 / playback 6 |
+| `NDITX` loopback + `ndi_transmitter.py` | 6ch |
+| NDI stream identity | `VibesboxSRC-5.1` |
+
+So a 7.1 source loses the pair on lane SD3, and that is a choice, not a hardware
+ceiling. Going to 8 would mean changing the CamillaDSP config, the loopback width,
+the transmitter, the stream name and REAPER's input — a system-wide change, not a
+one-line edit in the bridge. Nothing today needs it: the whole chain is 5.1 and
+REAPER's Penteo 360 owns the upmix.
 
 ### Rate-following, 2026-08-12 — the TV no longer has to be pinned to 48 kHz
 

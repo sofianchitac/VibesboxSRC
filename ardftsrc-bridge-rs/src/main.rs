@@ -280,6 +280,14 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
         // USB source above. Verified end to end 2026-08-12: multichannel LPCM arrives in
         // REAPER identically to USB and the bitstream bridge.
         //
+        // ★ THE TAP ITSELF DOES 8ch (7.1) — measured live 2026-08-12, all four lanes
+        // carrying discrete audio at an identical level. 6 is a DOWNSTREAM ceiling, not a
+        // tap limit: CamillaDSP's dsp_6ch.yml is capture 6 / playback 6, ndi_transmitter.py
+        // sends 6ch, and the NDI stream is literally named VibesboxSRC-5.1. So a 7.1 source
+        // loses the pair on lane SD3. Raising this to 8 means changing the CamillaDSP
+        // config, the NDITX loopback width, the transmitter, the stream identity and
+        // REAPER's input — a system-wide change, NOT a one-line edit here.
+        //
         // Always 6ch, with no stereo/multichannel detection: when the TV sends 2.0 the
         // unused lanes read EXACTLY zero (verified 2026-07-27), so stereo simply sits in
         // FL/FR with silent rears — the same contract as the 6ch USB source, and it matches
