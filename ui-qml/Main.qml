@@ -140,7 +140,7 @@ Window {
                         anchors.centerIn: parent
                         width: parent.width
                         fillMode: Image.PreserveAspectFit
-                        source: "../ui/vibesbox-logo.svg"
+                        source: "../ui/vibesbox-src-logo.svg"
                         sourceSize.width: width * 2
                         opacity: Theme.colorMode ? 1 : 0
                         Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.InOutSine } }
@@ -399,7 +399,7 @@ Window {
                 anchors.centerIn: parent
                 width: Theme.s(320)
                 fillMode: Image.PreserveAspectFit
-                source: "../ui/vibesbox-logo.svg"
+                source: "../ui/vibesbox-src-logo.svg"
                 sourceSize.width: width * 2
                 SequentialAnimation on scale {
                     running: splash.visible
