@@ -189,11 +189,27 @@ measured 96011 Hz -> 96000 Hz
 ```
 
 All six standard rates (44.1k–192k) open fine on this DAI — verified by opening each
-one. A measurement that snaps to no standard rate is refused rather than resampled
+one. **48k / 96k / 192k additionally verified running end to end**, switching live
+from the Mac; every measurement across them landed within 0.011%:
+
+```
+48003 -> 48000    96011 -> 96000    96003 -> 96000
+192009 -> 192000  48004 -> 48000
+```
+
+A measurement that snaps to no standard rate is refused rather than resampled
 against, because a bad estimate means wrong pitch, which is far less discoverable
 than silence. `source_router` publishes the offending rate as `tv_rate_unsupported`
 in its WS state so the UI can distinguish "unsupported rate" from "TV off" — before
 this they were indistinguishable, and the silence looked like a fault.
+
+★ **A cable dropout and a rate change look different in the log**, which is the
+quickest way to tell them apart when the HDMI link is a suspect. Both make the
+capture take an ALSA I/O error, but only a real clock loss makes source_router say
+`TV: eARC clock gone -> source idle` — on a rate change the clock never goes away, so
+the router goes straight to `eARC lpcm detected -> start`. Observed live on a
+flapping cable 2026-08-12: the link dropped at 96 kHz and came back **at 96 kHz**,
+i.e. the flap did not walk the bridge onto a wrong rate.
 
 Note that in practice a rate change re-handshakes the eARC link and the capture takes
 an ALSA I/O error first, which stops the bridge in ~1 s — faster than the 3-window
