@@ -490,7 +490,7 @@ fn main() {
                 }
                 Err(e) => {
                     if pcm.try_recover(e, true).is_err() {
-                        eprintln!("ardftsrc-bridge: capture unrecoverable, stopping");
+                        eprintln!("ardftsrc-bridge: capture unrecoverable: {e}, stopping");
                         cap_running.store(false, Ordering::SeqCst);
                         return;
                     }
