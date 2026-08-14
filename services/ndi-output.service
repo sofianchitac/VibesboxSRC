@@ -1,5 +1,5 @@
 [Unit]
-Description=NDI Output — 6ch Audio Transmitter (NDI SDK via Python)
+Description=NDI Output — 8ch Audio Transmitter (NDI SDK via Python)
 After=camilladsp.service alsa-loopback.service network-online.target avahi-daemon.service
 Requires=alsa-loopback.service
 Wants=network-online.target camilladsp.service
@@ -36,7 +36,11 @@ Environment=NDI_ALSA_DEV=hw:NDITX,1,0
 # NDI_PERIOD 1024 -> 512 with the rest of the 512 chain (2026-06-10 latency phase 2).
 # This env OVERRIDES the ndi_transmitter.py file default — edit here, not there.
 Environment=NDI_RATE=96000
-Environment=NDI_ALSA_CH=6
+# 8 since 2026-08-13 (was 6) — eARC LPCM surrounds ride lanes 7-8; see dsp_8ch.yml.
+# NDI_TX_NAME stays "VibesboxSRC-5.1" ON PURPOSE: the receiver finds the stream by that
+# exact name, so renaming it would break discovery on the LattePanda. The name is now
+# historical, not a description of the width.
+Environment=NDI_ALSA_CH=8
 Environment=NDI_PERIOD=512
 
 [Install]

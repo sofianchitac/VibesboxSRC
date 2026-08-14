@@ -1,0 +1,130 @@
+# VibesboxSRC — static 8ch passthrough (native PipeWire dsp-in -> dsp-out).
+#
+# Replaces dsp_6ch.yml as the pushed config from 2026-08-13. Reason: the eARC tap
+# delivers LPCM surrounds on lanes 7-8 (SD3), and the previous 6-lane read discarded
+# them — measured directly with `arecord -c 8`, see docs/latency-matrix-plan.md. The
+# whole chain now carries 8 so nothing is dropped on the Pi; REAPER continues to own
+# every channel decision, which is exactly why the fold is NOT done here.
+#
+# dsp_6ch.yml is kept for rollback. Nothing else about the design changes: still a
+# strict 1:1 passthrough, still the native PipeWire backend, still config-less boot
+# (`-w`) with source_router pushing this on connect.
+#
+# ⛔ This file must never become a place where channels are reordered or mixed. Every
+# dest N takes exactly channel N at gain 0. If a mapping is ever wrong, it is fixed in
+# REAPER.
+description: "static 8ch passthrough (native PipeWire dsp-in -> dsp-out)"
+devices:
+  adjust_period: null
+  capture:
+    type: PipeWire
+    channels: 8
+    node_name: dsp-in
+    node_description: "Vibesbox DSP input (8ch sum point)"
+    node_group_name: vibesbox-dsp   # shared driver/clock with playback (clock coherence)
+    autoconnect_to: null            # source_router.py is the sole routing authority
+  capture_samplerate: 96000
+  chunksize: 512  # = PipeWire quantum; matches PERIOD_FRAMES in ndi_transmitter.py
+  enable_rate_adjust: false   # PipeWire owns the clock/drift
+  multithreaded: null
+  playback:
+    type: PipeWire
+    channels: 8
+    node_name: dsp-out
+    node_description: "Vibesbox DSP output (8ch)"
+    node_group_name: vibesbox-dsp   # same group as capture
+    autoconnect_to: null            # daemon links dsp-out -> sink.ndi-feed
+  queuelimit: null
+  rate_measure_interval: null
+  resampler:
+    type: Synchronous
+  samplerate: 96000
+  silence_threshold: null
+  silence_timeout: null
+  stop_on_rate_change: null
+  target_level: 1536  # 3 x chunksize; nominal only — inert under the PipeWire backend
+  volume_limit: null
+  volume_ramp_time: null
+  worker_threads: null
+# The -4 dB intersample_headroom Gain lives in ardftsrc-bridge-rs (`HEADROOM` in
+# src/main.rs), applied before the f64->i32 clamp — not here. See dsp_6ch.yml's note.
+filters: null
+mixers:
+  8ch_passthrough:
+    channels:
+      in: 8
+      out: 8
+    description: null
+    labels: null
+    mapping:
+    - dest: 0
+      mute: null
+      sources:
+      - channel: 0
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+    - dest: 1
+      mute: null
+      sources:
+      - channel: 1
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+    - dest: 2
+      mute: null
+      sources:
+      - channel: 2
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+    - dest: 3
+      mute: null
+      sources:
+      - channel: 3
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+    - dest: 4
+      mute: null
+      sources:
+      - channel: 4
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+    - dest: 5
+      mute: null
+      sources:
+      - channel: 5
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+    - dest: 6
+      mute: null
+      sources:
+      - channel: 6
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+    - dest: 7
+      mute: null
+      sources:
+      - channel: 7
+        gain: 0
+        inverted: null
+        mute: null
+        scale: null
+pipeline:
+- bypassed: null
+  description: null
+  name: 8ch_passthrough
+  type: Mixer
+processors: null
+title: dsp_8ch (static 8ch passthrough)

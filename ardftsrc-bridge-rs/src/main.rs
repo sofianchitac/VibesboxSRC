@@ -307,12 +307,20 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
         // semantics it replaces (the bridge ran as long as the Pico was plugged in) and
         // is harmless: TV off = no bit clock = the capture simply blocks, and the node
         // stays linked carrying silence.
+        // ★ 8ch since 2026-08-13, was 6. A 6ch open reads SD0-SD2 only, and the source
+        // puts LPCM surrounds on lanes 7-8 (SD3) leaving lanes 5-6 digitally SILENT —
+        // measured with `arecord -c 8` against per-channel ID tones (the tap reports
+        // CHANNELS: [2 8]). Reading 6 collected 4 populated lanes plus 2 empty ones and
+        // discarded the surrounds entirely. Quiet lanes stay digitally silent, so 8 is
+        // unconditional — no channel-count detection to flap on quiet passages.
+        // ⛔ `position` is NOMINAL: it exists so the node has an 8ch layout. Lanes are
+        // passed through exactly as captured and REAPER maps them. Do not "fix" it here.
         "tv" => Some(SourceCfg {
             name: "tv",
             card: "eARC",
-            channels: 6,
+            channels: 8,
             in_device: "hw:eARC,0",
-            position: "[ FL FR FC LFE RL RR ]",
+            position: "[ FL FR FC LFE RL RR SL SR ]",
             hw_params: None,
             slave_measured: true,
         }),

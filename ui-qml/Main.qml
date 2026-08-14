@@ -37,6 +37,9 @@ Window {
         { name: "Tidal", title: "Tidal" },
         { name: "TV", title: "TV" },
     ]
+    // The bus is 8 wide since 2026-08-13; indices past this list fall through to the
+    // "Ch7"/"Ch8" fallback below, which is DELIBERATE. Naming lanes 7-8 would assert a
+    // speaker mapping, and mapping is REAPER's alone — a neutral label is the honest one.
     readonly property var channelLabels: router.channels > 2
         ? ["FL", "FR", "RL", "RR", "FC", "LFE"]   // fixed physical USB 5.1 order
         : ["L", "R"]

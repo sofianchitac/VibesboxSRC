@@ -2,29 +2,32 @@
 """
 NDI Audio Transmitter — NDI SDK 6.x via ctypes
 ================================================
-Reads 6ch FLOAT32LE / 96kHz audio from the NDITX ALSA snd-aloop read side
+Reads 8ch FLOAT32LE / 96kHz audio from the NDITX ALSA snd-aloop read side
 (hw:NDITX,1,0) and transmits it as a named NDI audio source on the network.
 
 Key design decisions vs. ndi-free-audio binary:
   - Reads NDITX by name ("hw:NDITX,1,0"), never by fragile PortAudio device index.
-  - Enforces exact ALSA params: 6ch / 96kHz / FLOAT32LE — will not silently
+  - Enforces exact ALSA params: 8ch / 96kHz / FLOAT32LE — will not silently
     negotiate a wrong format.
   - snd-aloop constrains device 1 to the same params as device 0 once CamillaDSP
     opens the write side; this script will retry until that happens.
-  - NDI audio frame: FLTP (planar float32), 6ch, 96kHz — all correct.
+  - NDI audio frame: FLTP (planar float32), 8ch, 96kHz — all correct.
   - Interleaved→planar conversion via numpy (zero-copy transpose).
   - No PortAudio, no binary EULA, no guessing.
 
 Reads from  : hw:NDITX,1,0  (snd-aloop read side — CamillaDSP writes to ,0,0)
 Transmits as: NDI source, name from NDI_TX_NAME env var (default VibesboxSRC-5.1)
 
-Pure 6ch passthrough: ALSA reads the 6ch sum bus and we transmit it verbatim.
-ch1-2 = FL/FR (a stereo source sits here), ch3-6 carry centre/LFE/rears if the
-source has them (silent otherwise). No per-mode logic — REAPER on the LattePanda
-owns all channel routing (passthrough / 6->2 downmix / stereo upmix). The Pi's
-NDI/S-PDIF selection is now a transport mute in source_router (it links/unlinks
-the output sink), entirely independent of this transmitter.
-NDI_ALSA_CH controls the ALSA read width (= the NDI send width); default 6.
+Pure 8ch passthrough: ALSA reads the 8ch sum bus and we transmit it verbatim.
+A narrower source simply leaves the lanes it does not use digitally silent. No
+per-mode logic — REAPER on the LattePanda owns all channel routing, and this
+script must never reorder, fold or remap anything.
+NDI_ALSA_CH controls the ALSA read width (= the NDI send width); default 8.
+
+★ 8 since 2026-08-13, was 6: the eARC tap delivers LPCM surrounds on lanes 7-8
+and the old 6-wide chain discarded them (measured with `arecord -c 8`). The
+stream NAME stays "VibesboxSRC-5.1" — the receiver discovers it by that exact
+string, so the name is historical and no longer describes the width.
 
 Lifecycle:
   Managed by ndi-output.service. Started once and left running; source_router no
@@ -53,7 +56,7 @@ logging.basicConfig(
 NDI_LIB_PATH   = os.environ.get("NDI_LIB_PATH",   "/usr/local/lib/libndi.so")
 ALSA_DEVICE    = os.environ.get("NDI_ALSA_DEV",   "hw:NDITX,1,0")
 SAMPLE_RATE    = int(os.environ.get("NDI_RATE",    "96000"))
-ALSA_CHANNELS  = int(os.environ.get("NDI_ALSA_CH", "6"))   # ALSA read width (NDITX is 6ch)
+ALSA_CHANNELS  = int(os.environ.get("NDI_ALSA_CH", "8"))   # ALSA read width (NDITX is 8ch)
 NDI_CHANNELS   = ALSA_CHANNELS                              # NDI send width = read width (pure passthrough)
 PERIOD_FRAMES  = int(os.environ.get("NDI_PERIOD",  "1024"))   # match CamillaDSP chunksize
 NDI_NAME       = os.environ.get("NDI_TX_NAME",    "VibesboxSRC-5.1")
@@ -137,8 +140,8 @@ def open_alsa_capture() -> alsaaudio.PCM:
     Open the NDITX snd-aloop read side with exact params.
 
     snd-aloop locks device 1 to the same format as device 0 once CamillaDSP
-    opens the write side. We retry until CamillaDSP has applied its 6ch config
-    and the loopback accepts FLOAT32LE / 6ch / 96kHz.
+    opens the write side. We retry until CamillaDSP has applied its 8ch config
+    and the loopback accepts FLOAT32LE / 8ch / 96kHz.
 
     Raises RuntimeError if the device never becomes available.
     """

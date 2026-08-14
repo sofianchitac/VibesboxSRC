@@ -69,7 +69,7 @@ CDSP_PORT = 1234
 CONFIG_DIR = "/opt/vibesbox-src/camilladsp"
 # CamillaDSP always runs the static 6ch passthrough — REAPER on the LattePanda
 # owns all channel routing (passthrough / downmix / stereo upmix).
-DSP_PASSTHROUGH = "dsp_6ch.yml"
+DSP_PASSTHROUGH = "dsp_8ch.yml"   # 8ch since 2026-08-13 (dsp_6ch.yml kept for rollback)
 
 SOURCES_MUTED_STATE_FILE = "/opt/vibesbox-src/state/sources_muted"
 
@@ -84,6 +84,11 @@ SINK_NDI = "sink.ndi-feed"   # 6ch NDI feed (NDITX snd-aloop wrap) — the only 
 
 CH6 = ["FL", "FR", "FC", "LFE", "RL", "RR"]
 CH2 = ["FL", "FR"]
+# 8-wide since 2026-08-13. The eARC LPCM surrounds arrive on lanes 7-8 and the chain now
+# carries them all the way to REAPER. These are POSITIONAL NAMES ONLY — they identify
+# ports so links can be authored, and imply nothing about what each lane carries. Channel
+# meaning is REAPER's alone.
+CH8 = CH6 + ["SL", "SR"]
 
 # Per-source SRC engine (user decision 2026-05-29, after the blind listening gate): the three
 # active sources ALL use the ffmpeg/librempeg ARDFTSRC bridge — USB + Lyrion + AirPlay each feed
@@ -97,7 +102,8 @@ ARDFTSRC_SOURCES = {"USB", "Lyrion", "AirPlay", "Tidal", "TV"}
 # Source registry.
 #   names       = candidate exact node.name matches (the bridge's source.X.ardftsrc node first).
 #   prefix      = match any node.name starting with this (bluez nodes are MAC-specific).
-#   channels    = 6 links all of CH6, 2 links FL/FR only (rears silent — no on-Pi upmix).
+#   channels    = link width: 8 -> CH8, 6 -> CH6, anything else -> CH2 (FL/FR only).
+#                 No on-Pi upmix — a narrow source just leaves the other lanes silent.
 #   bridge_unit = the ardftsrc-bridge@<src> unit to start when the source goes ALSA-active.
 #   alsa_detect = how to detect first activity at the ALSA layer (the ardftsrc source has no PW
 #                 node until ffmpeg creates one, so PW-state can't see *first* activity):
@@ -170,7 +176,7 @@ POLL_INTERVAL          = 0.5    # 2 Hz reconcile + telemetry
 WS_FULL_STATE_INTERVAL = 0.5    # 2 Hz state frame
 PW_TIMEOUT             = 4      # subprocess timeout for pw-* commands
 
-# Multichannel detection: any of the non-front channels (ch3-6 = RL/RR/FC/LFE)
+# Multichannel detection: any of the non-front channels (ch3 upward)
 # carrying audio means the active source is multichannel. CamillaDSP reports a
 # truly silent channel as -1000 dB, so the threshold is far above the floor and
 # below any real content. Debounced over consecutive 2 Hz polls (6 = ~3 s) so a
@@ -320,7 +326,7 @@ class SourceRouter:
         return (obj.get("info") or {}).get("props") or {}
 
     # Native-backend CDSP nodes (dsp-in / dsp-out) emit ports with audio.channel="UNK"
-    # and positional names input_<N> / output_<N> (N = 1..6). We key those by CH6[N-1]
+    # and positional names input_<N> / output_<N> (N = 1..8). We key those by CH8[N-1]
     # so reconcile() can look them up under the Vibesbox channel convention.
     _CDSP_PORT_NAME_RE = re.compile(r"^(?:input|output)_(\d+)$")
 
@@ -372,8 +378,8 @@ class SourceRouter:
                     m = self._CDSP_PORT_NAME_RE.match(p.get("port.name") or "")
                     if m:
                         idx = int(m.group(1))
-                        if 1 <= idx <= len(CH6):
-                            ch = CH6[idx - 1]
+                        if 1 <= idx <= len(CH8):
+                            ch = CH8[idx - 1]
                 if not ch:
                     continue
                 table = out_ports if direction == "output" else in_ports
@@ -578,11 +584,15 @@ class SourceRouter:
     # RATES, and different downstream channel counts, so we probe the tap and pick one.
     # Keys match _probe_earc()'s returned mode.
     TV_BRIDGES = {                                  # mode -> (unit, channels)
-        # 6ch since 2026-08-12: the eARC tap's 4 data lanes carry up to 8ch LPCM and a 6ch
-        # open reads SD0-SD2. Stereo content still just sits in FL/FR — the unused lanes are
-        # digitally silent — so this is 6ch unconditionally, with no channel-count detection
-        # to flap on quiet passages. Matches the 6ch USB source's contract.
-        "lpcm": ("ardftsrc-bridge@tv.service", 6),          # DFT resampler @48k
+        # ★ LPCM is 8ch since 2026-08-13. A 6ch open reads only SD0-SD2, and the source
+        # puts the LPCM surrounds on lanes 7-8 (SD3) with lanes 5-6 digitally SILENT —
+        # measured directly with `arecord -c 8`, see docs/latency-matrix-plan.md. Reading
+        # 6 therefore collected 4 populated lanes plus 2 empty ones and threw the
+        # surrounds away. 8 unconditionally, no channel-count detection to flap on quiet
+        # passages. ⛔ The lanes are passed through as captured; REAPER maps them.
+        # The coded modes stay at 6 ON PURPOSE: their bridges DECODE to 5.1 downstream of
+        # the tap, so they were never affected and their output really is 6 wide.
+        "lpcm": ("ardftsrc-bridge@tv.service", 8),          # DFT resampler @48k
         "eac3": ("earc-bitstream-bridge@eac3.service", 6),  # DD+ / streaming Atmos @192k
         "ac3":  ("earc-bitstream-bridge@ac3.service", 6),   # legacy DD @48k
         "dts":  ("earc-bitstream-bridge@dts.service", 6),   # legacy DTS core @48k
@@ -881,7 +891,11 @@ class SourceRouter:
                 ndi_id = names.get(SINK_NDI)
                 if ndi_id is not None:
                     dst_p = in_ports.get(ndi_id, {})
-                    for ch in CH6:
+                    # CH8, not CH6 — dsp-out and sink.ndi-feed are both 8 wide now, and
+                    # a CH6 loop silently left lanes 7-8 unlinked (i.e. the surrounds we
+                    # widened the chain to keep). Safe at either width: the membership
+                    # test below only links ports that actually exist on both nodes.
+                    for ch in CH8:
                         if ch in src_p and ch in dst_p:
                             desired.add((src_p[ch], dst_p[ch]))
 
@@ -914,7 +928,11 @@ class SourceRouter:
                 self.sources_playing[name] = running
 
                 if not self.sources_muted[name] and dsp_in_id is not None:
-                    chs = CH6 if spec["channels"] == 6 else CH2
+                    # Explicit width -> port-list map. This was `CH6 if channels == 6 else
+                    # CH2`, which sent the new 8ch TV source down the STEREO branch and
+                    # linked 2 of its 8 lanes — the deploy looked healthy and quietly
+                    # dropped more than the bug it was fixing (2026-08-13).
+                    chs = {8: CH8, 6: CH6}.get(spec["channels"], CH2)
                     src_p = out_ports.get(nid, {})
                     dst_p = in_ports.get(dsp_in_id, {})
                     for ch in chs:
@@ -1038,7 +1056,7 @@ class SourceRouter:
 
     def _poll_multichannel(self):
         """Detect the channel format of the summed bus by reading CamillaDSP's
-        per-channel playback RMS. Any of ch3-6 (RL/RR/FC/LFE) above threshold =
+        per-channel playback RMS. Any non-front channel (ch3 upward) above threshold =
         multichannel; fronts above threshold with silent rears = stereo; silence
         is neither. Debounced in both directions; only sustained changes update
         the flags. The LattePanda kiosk acts on the False->True edge of each."""
@@ -1049,7 +1067,12 @@ class SourceRouter:
         if not rms or len(rms) < 6:
             return
 
-        active = max(rms[2:6]) > MULTICH_RMS_THRESHOLD_DB
+        # rms[2:] (open-ended) not rms[2:6]: the bus is 8 wide since 2026-08-13, and this
+        # stays correct at either width if dsp_6ch.yml is ever rolled back. Correct for
+        # all three cases — 2.0 leaves ch2+ silent; 5.1 lights ch2/ch3; and eARC LPCM
+        # lands its surrounds on ch6/ch7 with ch4/ch5 silent, which only a slice reaching
+        # the last channel will see.
+        active = max(rms[2:]) > MULTICH_RMS_THRESHOLD_DB
         # Gated on the debounced flag too, so a null-rear passage inside a 5.1
         # program can't start the stereo counter while multichannel still holds.
         stereo_now = (not active and not self.multichannel
@@ -1069,7 +1092,7 @@ class SourceRouter:
 
         if not self.multichannel and self._multich_on_count >= MULTICH_DEBOUNCE_POLLS:
             self.multichannel = True
-            logging.info(f"multichannel detected (non-front RMS {max(rms[2:6]):.1f} dB).")
+            logging.info(f"multichannel detected (non-front RMS {max(rms[2:]):.1f} dB).")
         elif self.multichannel and self._multich_off_count >= MULTICH_DEBOUNCE_POLLS:
             self.multichannel = False
             logging.info("multichannel cleared (front-only / silent).")
