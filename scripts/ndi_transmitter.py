@@ -59,6 +59,11 @@ SAMPLE_RATE    = int(os.environ.get("NDI_RATE",    "96000"))
 ALSA_CHANNELS  = int(os.environ.get("NDI_ALSA_CH", "8"))   # ALSA read width (NDITX is 8ch)
 NDI_CHANNELS   = ALSA_CHANNELS                              # NDI send width = read width (pure passthrough)
 PERIOD_FRAMES  = int(os.environ.get("NDI_PERIOD",  "1024"))   # match CamillaDSP chunksize
+# Start-up backlog drain — see drain_capture_backlog(). A period out of backlog
+# returns instantly; one at the live edge cannot beat real time. Anything under
+# this fraction of a period is therefore backlog, not live audio.
+DRAIN_LIVE_FRACTION = float(os.environ.get("NDI_DRAIN_FRACTION", "0.5"))
+DRAIN_MAX_S         = float(os.environ.get("NDI_DRAIN_MAX_S",   "3.0"))
 NDI_NAME       = os.environ.get("NDI_TX_NAME",    "VibesboxSRC-5.1")
 
 ALSA_OPEN_RETRIES    = 30     # attempts before giving up
@@ -173,8 +178,98 @@ def open_alsa_capture() -> alsaaudio.PCM:
     raise RuntimeError(
         f"Could not open ALSA capture device '{ALSA_DEVICE}' "
         f"after {ALSA_OPEN_RETRIES} attempts. "
-        f"Is CamillaDSP running a 6ch output config?"
+        f"Is CamillaDSP running an {ALSA_CHANNELS}ch output config?"
     )
+
+
+def drain_capture_backlog(pcm: alsaaudio.PCM) -> None:
+    """Discard whatever is already sitting in the loopback before going live.
+
+    CamillaDSP writes into the NDITX snd-aloop continuously. Whenever this reader is
+    away — a restart, or any stall long enough to gap the read — the buffer fills with
+    nobody draining it, and on reopen that backlog sits IN FRONT OF every subsequent
+    sample for the life of the process. Measured 10-43 ms discarded per open.
+
+    ⛔ WHAT THIS IS *NOT*. It does NOT fix the latency ratchet in
+    docs/latency-matrix-plan.md §17-18, and it was written believing that it would.
+    Tested against the same procedure that found the ratchet: with this drain live, four
+    `systemctl restart ndi-output` still stepped 250.9 -> 268.7 -> 288.8 -> 314.8 ms.
+    The dominant accumulator is UPSTREAM of this reader — confirmed accumulator #1 is
+    ardftsrc-bridge's own input ring, parked in the dead band below its `keep * 8`
+    (8192-frame) trim threshold, and a second one between the bridge and here is still
+    unlocated. Restarting `ardftsrc-bridge@tv` clears the step; restarting THIS service
+    does not, and is in fact a cause.
+
+    ⇒ Kept because discarding stale loopback audio at open is correct on its own terms,
+    not because it solves that. Do not cite it as the fix, and do not let its presence
+    stop the search for accumulator #2.
+
+    Detection is by TIMING, deliberately, so it needs nothing from the binding beyond
+    the blocking read we already do: a period served out of backlog returns
+    immediately, whereas a period at the live edge cannot arrive faster than real time.
+    We discard until a read actually blocks — that is the moment the backlog is gone.
+    (An avail()-based version would be tidier but is not portable across pyalsaaudio
+    versions, and this runs once per open.)
+    """
+    # ⚠ The period is whatever snd-aloop locked to CamillaDSP's chunksize, NOT
+    # PERIOD_FRAMES — measured 512, while PERIOD_FRAMES defaults to 1024. Using the
+    # requested size would double the threshold and call live audio "backlog".
+    # Defensive: this runs inside the production transmitter, and an exception here
+    # would take NDI output down entirely. A wrong-but-sane threshold is survivable;
+    # a crash is not. (pyalsaaudio 0.11.0 on the Pi does provide period_size.)
+    try:
+        period_frames = int(pcm.info().get("period_size") or 0) or PERIOD_FRAMES
+    except Exception as exc:
+        logging.warning(f"drain: could not read period_size ({exc}); "
+                        f"falling back to the requested {PERIOD_FRAMES}.")
+        period_frames = PERIOD_FRAMES
+    period_s = period_frames / SAMPLE_RATE
+    live_threshold = period_s * DRAIN_LIVE_FRACTION
+    deadline = time.monotonic() + DRAIN_MAX_S
+    frames = periods = slow = 0
+    first = True
+
+    while time.monotonic() < deadline:
+        t0 = time.monotonic()
+        try:
+            length, _ = pcm.read()
+        except alsaaudio.ALSAAudioError as exc:
+            logging.warning(f"drain: ALSA read error, stopping drain early: {exc}")
+            break
+        elapsed = time.monotonic() - t0
+        if first:
+            # ⚠ The FIRST read also STARTS the stream, so its duration measures
+            # start-up, not backlog. Timing it broke the whole drain on the first
+            # deploy: it reported "already at the live edge" every time while the
+            # ratchet was still there. Discard it and start judging from the second.
+            first = False
+            if length > 0:
+                frames += length
+                periods += 1
+            continue
+        if elapsed >= live_threshold:
+            # Require TWO consecutive slow reads: one scheduling hiccup mid-drain
+            # would otherwise end it early and leave the backlog in place.
+            slow += 1
+            if slow >= 2:
+                break
+            continue
+        slow = 0
+        if length > 0:                 # a backlog period; drop it
+            frames += length
+            periods += 1
+    else:
+        logging.warning(
+            f"drain: hit the {DRAIN_MAX_S:.1f}s cap still reading faster than real "
+            f"time after {frames} frames. Going live anyway — the writer may be "
+            f"running fast, which is a different problem to this one."
+        )
+
+    if frames:
+        logging.info(f"drain: discarded {frames} frames ({frames / SAMPLE_RATE * 1000:.1f} ms, "
+                     f"{periods} periods) of stale loopback backlog before going live.")
+    else:
+        logging.info("drain: loopback was already at the live edge, nothing to discard.")
 
 
 # ── Main transmitter loop ──────────────────────────────────────────────────────
@@ -202,6 +297,7 @@ def run():
 
     # ── Open ALSA capture ─────────────────────────────────────────────────────
     pcm = open_alsa_capture()
+    drain_capture_backlog(pcm)
 
     # ── NDI audio frame (reused every period) ────────────────────────────────
     frame = NDIlib_audio_frame_v3_t()
@@ -248,6 +344,9 @@ def run():
                     pass
                 try:
                     pcm = open_alsa_capture()
+                    # Same drain as at startup: this reopen follows an error burst,
+                    # so the loopback has been filling unread for at least as long.
+                    drain_capture_backlog(pcm)
                     consecutive_errors = 0
                 except RuntimeError as e:
                     logging.error(str(e))
@@ -269,7 +368,7 @@ def run():
         # data is bytes: FLOAT32LE interleaved, shape (length × ALSA_CHANNELS)
         interleaved = np.frombuffer(data, dtype=np.float32).reshape(length, ALSA_CHANNELS)
 
-        # Pure 6ch passthrough: ch1-2 = FL/FR, ch3-6 carry whatever the sum bus has
+        # Pure passthrough: ch1-2 = FL/FR, the rest carry whatever the sum bus has
         # (silent if the source is stereo). No per-mode logic — REAPER owns all
         # channel routing on the LattePanda. Transpose to planar (channels × frames)
         # for NDI FLTP; ascontiguousarray makes it C-contiguous for ctypes.
