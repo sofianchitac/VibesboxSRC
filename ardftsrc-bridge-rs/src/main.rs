@@ -72,6 +72,10 @@ const TARGET_RATE: u32 = 96_000;
 // clean for 15 minutes before tipping over — do NOT shrink OUT_BUFFER again without a
 // multi-hour soak. Burst absorption is still the input ring's job, not these buffers'.
 const CAP_PERIOD: i64 = 1024;
+/// Window over which the ring's minimum occupancy is tracked for the dead-band trim.
+/// Long on purpose: it must comfortably outlast normal drain cycles so that only backlog
+/// which NEVER drains raises the floor. See the trim block in the process loop.
+const FLOOR_WINDOW: Duration = Duration::from_secs(10);
 const CAP_BUFFER: i64 = 4096;
 const OUT_PERIOD: i64 = 1024;
 const OUT_BUFFER: i64 = 4096;
@@ -749,16 +753,23 @@ fn main() {
     let mut first_write_done = false;
     let mut startup_trimmed = false;
     let mut over_since: Option<Instant> = None;
+    // Ring FLOOR over a window — the statistic that separates slack from backlog. See
+    // the trim block below for why the PEAK cannot.
+    let mut floor_min = usize::MAX;
+    let mut floor_since = Instant::now();
     let mut last_diag = Instant::now();
-    let diag = |tag: &str, cap_f: i64, ring_samples: usize, ready_samples: usize, out_f64: i64| {
+    let diag = |tag: &str, cap_f: i64, ring_samples: usize, ready_samples: usize, out_f64: i64,
+                floor_samples: usize| {
         let cap_ms = cap_f as f64 * 1000.0 / rate as f64;
         let ring_frames = ring_samples / channels;
         let ring_ms = ring_frames as f64 * 1000.0 / rate as f64;
         let ready_frames = ready_samples / channels;
         let ready_ms = ready_frames as f64 * 1000.0 / TARGET_RATE as f64;
         let out_ms = out_f64 as f64 * 1000.0 / TARGET_RATE as f64;
+        let floor_frames = if floor_samples == usize::MAX { 0 } else { floor_samples / channels };
         eprintln!(
             "ardftsrc-bridge[diag {tag}]: cap={cap_f}f({cap_ms:.1}ms) ring={ring_frames}f({ring_ms:.1}ms) \
+             floor={floor_frames}f \
              rs~{group_ms:.1}ms ready={ready_frames}f({ready_ms:.1}ms) out={out_f64}f({out_ms:.1}ms) sum~{:.1}ms",
             cap_ms + ring_ms + group_ms + ready_ms + out_ms
         );
@@ -766,6 +777,10 @@ fn main() {
 
     'process: while running.load(Ordering::Relaxed) {
         let avail = cons.occupied_len();
+        // ⚠ BEFORE the empty-ring early-continue, on purpose: a healthy ring alternates
+        // 0 <-> one period, and its floor IS the zero. Sampling only the non-empty passes
+        // would make every state look permanently backlogged.
+        floor_min = floor_min.min(avail);
         if avail == 0 {
             thread::sleep(Duration::from_micros(500));
             continue;
@@ -802,7 +817,34 @@ fn main() {
         } else {
             over_since = None;
         }
+
+        //    (3) dead-band trim, on the ring's FLOOR rather than its peak. (2) watches the
+        //        MAXIMUM, and every ratchet ever measured sat at 1024-4096 frames — 2-8x
+        //        BELOW its 8x threshold and permanent there (docs/latency-matrix-plan.md
+        //        section 20, where it cost ~86 ms of the Pi's ~128 ms path). Raising (2)'s
+        //        sensitivity is the wrong fix: the 8x exists so it cannot false-trip, and
+        //        lowering it re-creates exactly that risk.
+        //        What separates the two states is the MINIMUM. Measured:
+        //            clean     ring alternates 0 <-> 1024 frames  -> floor 0
+        //            ratcheted ring sits      2048..4096 frames   -> floor 2048
+        //        Genuine slack drains to nominal constantly; backlog never comes down. So
+        //        trim only what the ring provably never consumed — the floor over a long
+        //        window — and require two full periods resident before acting, which the
+        //        clean state never reaches. Each trim costs one brief audible skip, so this
+        //        must fire once per stall event, not continuously: the window resets after
+        //        every trim, and post-trim the floor returns to 0. ──
+        if !trim_to_keep && first_write_done && floor_since.elapsed() >= FLOOR_WINDOW {
+            if floor_min >= keep * 2 {
+                trim_to_keep = true;
+                trim_tag = "deadband";
+            }
+            floor_min = usize::MAX;
+            floor_since = Instant::now();
+        }
+
         if trim_to_keep {
+            floor_min = usize::MAX;
+            floor_since = Instant::now();
             let mut drop_left = avail - keep;
             let dropped = drop_left;
             while drop_left > 0 {
@@ -887,6 +929,7 @@ fn main() {
                 cons.occupied_len(),
                 rs.num_samples_ready(),
                 out_pcm.delay().unwrap_or(-1),
+                floor_min,
             );
         } else if first_write_done && last_diag.elapsed() >= Duration::from_secs(5) {
             last_diag = Instant::now();
@@ -896,6 +939,7 @@ fn main() {
                 cons.occupied_len(),
                 rs.num_samples_ready(),
                 out_pcm.delay().unwrap_or(-1),
+                floor_min,
             );
         }
     }
