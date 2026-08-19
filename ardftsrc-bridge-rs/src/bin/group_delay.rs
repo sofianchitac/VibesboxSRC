@@ -47,6 +47,9 @@ fn main() {
     let mut written = 0usize;
     let mut read_frames = 0usize;
     let mut samples = Vec::new();
+    let mut prime_silence = 0usize;
+    let mut first_real = 0usize;
+    let mut seen_real = false;
 
     for f in 0..total_frames {
         for _ in 0..ch {
@@ -58,6 +61,17 @@ fn main() {
                 Some(n) if n > 0 => n,
                 _ => break,
             };
+            if !seen_real {
+                for f_i in 0..got / ch {
+                    if RealtimeResampler::<f64>::sample_is_underrun(buf[f_i * ch]) {
+                        prime_silence += 1;
+                    } else {
+                        first_real = read_frames + f_i;
+                        seen_real = true;
+                        break;
+                    }
+                }
+            }
             read_frames += got / ch;
         }
         if f % (in_sr / 10) == 0 && f > 0 {
@@ -65,6 +79,20 @@ fn main() {
             samples.push((f as f64 / in_sr as f64, lag_ms));
         }
     }
+
+    // ── Priming vs steady state ──
+    // `with_rodio_fast_start` is read ONLY by RodioResampler (rodio.rs); it never reaches
+    // RealtimeResampler, so it is not a lever here. The question it raises is still worth
+    // answering: does priming leave a PERMANENT reservoir, or is it a one-off startup cost
+    // we already pay in silence? `sample_is_underrun` flags the negative-zero silence the
+    // resampler emits until primed, so count it.
+    println!();
+    println!("  priming silence emitted: {prime_silence} frames = {:.2} ms of output",
+             prime_silence as f64 * 1000.0 / out_sr as f64);
+    println!("  first real output at output-frame {first_real} ({:.2} ms in)",
+             first_real as f64 * 1000.0 / out_sr as f64);
+    println!("  estimate_priming_samples says {:.2} ms of INPUT (2 blocks)",
+             (prim / ch) as f64 * 1000.0 / in_sr as f64);
 
     println!();
     println!("  t(s)   in-flight hold (ms)");
