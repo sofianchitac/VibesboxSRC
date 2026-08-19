@@ -623,6 +623,15 @@ fn main() {
     // incremented by successful reads, so a stalled or clockless capture simply stops
     // advancing it, which reads as "no signal" rather than as a slower rate.
     let cap_frames_w = cap_frames.clone();
+    // ⛔ `cap=` is `pcm.delay()` sampled AFTER readi returns, i.e. the residual left once we
+    // have already drained a full buffer. It structurally cannot see the time spent WAITING
+    // for those frames — and `readi` is called with a CAP_PERIOD-sized buffer on a blocking
+    // PCM, so it waits for the whole quantum regardless of what period ALSA granted. That
+    // wait is real capture latency and has never been measured. These two record it.
+    let cap_readi_us = Arc::new(AtomicI64::new(0));
+    let cap_readi_n = Arc::new(AtomicI64::new(0));
+    let cap_readi_us_w = cap_readi_us.clone();
+    let cap_readi_n_w = cap_readi_n.clone();
     // Stage 2 (mid-stream auto-switch): only the TV source can receive an IEC 61937
     // bitstream (the TV switches stereo<->Dolby with content). When that happens
     // this DFT resampler would emit noise, so the capture thread scans for the burst
@@ -669,8 +678,11 @@ fn main() {
         let mut tv_gap: usize = 0;
         const TV_SYNC_WINDOW: usize = 16384;
         while cap_running.load(Ordering::Relaxed) {
+            let t_readi = Instant::now();
             match io.readi(&mut raw) {
                 Ok(n) => {
+                    cap_readi_us_w.store(t_readi.elapsed().as_micros() as i64, Ordering::Relaxed);
+                    cap_readi_n_w.store(n as i64, Ordering::Relaxed);
                     let samples = n * cap_channels;
                     for i in 0..samples {
                         f[i] = i32_to_f64(raw[i]);
@@ -830,6 +842,11 @@ fn main() {
     let diag = |tag: &str, cap_f: i64, ring_samples: usize, ready_samples: usize, out_f64: i64,
                 floor_samples: usize, low_frac: f64| {
         let cap_ms = cap_f as f64 * 1000.0 / rate as f64;
+        // The read quantum actually in force, and how long the capture thread blocked for it.
+        // Mean wait for a frame to enter the ring is half this — the term `cap=` misses.
+        let rq_n = cap_readi_n.load(Ordering::Relaxed);
+        let rq_us = cap_readi_us.load(Ordering::Relaxed);
+        let rq_ms = rq_n as f64 * 1000.0 / rate as f64;
         let ring_frames = ring_samples / channels;
         let ring_ms = ring_frames as f64 * 1000.0 / rate as f64;
         let ready_frames = ready_samples / channels;
@@ -840,10 +857,11 @@ fn main() {
         // acts on this, not on the floor — see LOW_FRAC_MAX.
         let low_pct = low_frac * 100.0;
         eprintln!(
-            "ardftsrc-bridge[diag {tag}]: cap={cap_f}f({cap_ms:.1}ms) ring={ring_frames}f({ring_ms:.1}ms) \
+            "ardftsrc-bridge[diag {tag}]: cap={cap_f}f({cap_ms:.1}ms) readq={rq_n}f({rq_ms:.1}ms,blocked {rq_us}us) \
+             ring={ring_frames}f({ring_ms:.1}ms) \
              floor={floor_frames}f low={low_pct:.0}% \
              rs~{group_ms:.1}ms ready={ready_frames}f({ready_ms:.1}ms) out={out_f64}f({out_ms:.1}ms) sum~{:.1}ms",
-            cap_ms + ring_ms + group_ms + ready_ms + out_ms
+            cap_ms + rq_ms / 2.0 + ring_ms + group_ms + ready_ms + out_ms
         );
     };
 
