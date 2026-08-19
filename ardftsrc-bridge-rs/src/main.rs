@@ -71,7 +71,27 @@ const TARGET_RATE: u32 = 96_000;
 // v4+OUT-1024/4096 clean: 0 trims, ring locked 23-46 ms). The broken sizing once ran
 // clean for 15 minutes before tipping over — do NOT shrink OUT_BUFFER again without a
 // multi-hour soak. Burst absorption is still the input ring's job, not these buffers'.
-const CAP_PERIOD: i64 = 1024;
+// ★ 2026-08-19 A/B: 1024 -> 256. This is the ALSA READ QUANTUM, and it is the term `cap=`
+// never showed: `readi` is called with a CAP_PERIOD-sized buffer on a BLOCKING pcm, so the
+// capture thread waits for the whole quantum regardless of the period ALSA granted (the USB
+// gadget grants 170 and it makes no difference). Measured at 1024: `readq=1024f(23.2ms,
+// blocked 23108us)` — so a frame waits a mean of half a quantum, 11.6 ms @44.1k, before it
+// even enters the ring. At 256 that becomes 2.9 ms, on EVERY source.
+// ⚠ The one piece of counter-evidence is the 2026-06 note above (a 512 capture period
+// "WIDENED the ring slack band"). That experiment did test a real variable — the read
+// quantum is effective everywhere — so it has to be re-tested, not waved away. Watch the
+// `ring=` band and the trim rate, and watch for capture overruns from the extra wakeups
+// (172/s at 256 vs 43/s at 1024).
+const CAP_PERIOD: i64 = 256;
+/// Ring slack unit for the backlog trim, DELIBERATELY decoupled from `CAP_PERIOD`.
+///
+/// ⛔ These were the same constant, which would have made the A/B above worthless: `keep`
+/// sets the trim quantum, both dead-band guard thresholds AND the depth-histogram bucket
+/// width, so moving `CAP_PERIOD` would have moved the entire ratchet machinery with it and
+/// no comparison would have meant anything. Every bad conclusion in this project's history
+/// came from moving two things at once; this holds the trim side fixed at its measured
+/// value so the read quantum is the only variable.
+const TRIM_UNIT: i64 = 1024;
 /// Window over which the ring's minimum occupancy is tracked for the dead-band trim.
 /// Long on purpose: it must comfortably outlast normal drain cycles so that only backlog
 /// which NEVER drains raises the floor. See the trim block in the process loop.
@@ -800,7 +820,7 @@ fn main() {
     //    out everything it has ready. The blocking writei into the "pipewire" PCM paces
     //    the loop to the 96k graph clock. Unlike the chunk API there is no input hoarding:
     //    the ring holds only scheduling slack (one writei-block worth). ──
-    let pop_cap = CAP_PERIOD as usize * channels * 4; // up to 4 capture periods/iteration
+    let pop_cap = TRIM_UNIT as usize * channels * 4; // unchanged by the CAP_PERIOD A/B
     let mut in_buf = vec![0.0f64; pop_cap];
     let out_cap = OUT_PERIOD as usize * channels * 4;
     let mut out_f = vec![0.0f64; out_cap];
@@ -837,7 +857,7 @@ fn main() {
     let mut last_poll = Instant::now();
     // One source of truth for the trim threshold: the in-loop `keep` binds to this, and the
     // low-time accumulator above the early-continue needs it before that binding exists.
-    let keep_elems = CAP_PERIOD as usize * channels;
+    let keep_elems = TRIM_UNIT as usize * channels;
     let mut last_diag = Instant::now();
     let diag = |tag: &str, cap_f: i64, ring_samples: usize, ready_samples: usize, out_f64: i64,
                 floor_samples: usize, low_frac: f64| {
