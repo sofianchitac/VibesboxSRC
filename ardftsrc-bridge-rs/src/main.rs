@@ -107,6 +107,24 @@ const FLOOR_WINDOW: Duration = Duration::from_secs(10);
 /// 5%: a false trip needs the ring non-empty 95% of a window, and the latch below bounds it
 /// to one trim per bridge start anyway.
 const LOW_FRAC_MAX: f64 = 0.05;
+/// Share of a window the ring must spend at **two or more whole periods** for it to count as
+/// backlogged. THIS is the trim trigger; `LOW_FRAC_MAX`/`persistent` are now reported only.
+///
+/// ⛔⛔ `low` (time at depth 0) was the wrong statistic and no threshold could fix it, because
+/// it conflates "sits at exactly one period" — which is the slack `keep` is *supposed* to be —
+/// with "is backlogged". Measured at window close, 2026-08-19, one config, three sources:
+///
+/// | source | `low` | `hist%` | time at depth >=2 | actually |
+/// |---|---|---|---|---|
+/// | tv (LPCM 48k) | 31-34% | [33,67,0,0] | **0%** | healthy |
+/// | lyrion        | 12-14% | [13,82,5,0] | **4-6%** | healthy |
+/// | usb           | 5-6%   | [5,43,52,0] | **41-52%** | ratcheted |
+///
+/// `low` puts tv and usb on OPPOSITE sides while both are normal for their source, and any
+/// threshold that catches usb (needs >5%) also catches lyrion (12-14%) and would trim the
+/// best source in the system for a ring holding one period. Depth>=2 separates all three with
+/// nothing at all between 6% and 41%; 0.25 sits in the middle of that gap.
+const DEEP_FRAC_MIN: f64 = 0.25;
 /// How many whole capture periods of backlog the depth histogram can resolve. The ratchet
 /// has never been seen past ~4; 8 is headroom, and the cost is 9 `Duration` adds per window.
 const DEPTH_BUCKETS: usize = 8;
@@ -1002,19 +1020,30 @@ fn main() {
                     persistent = k + 1;
                 }
             }
+            // Time-weighted share of the window spent holding TWO OR MORE whole periods.
+            // Buckets 2.. are exactly that, so this needs no percentile walk and no
+            // sensitivity to bucket 0 — see DEEP_FRAC_MIN.
+            let deep_frac = if total > 0.0 {
+                depth_hist[2..].iter().map(|d| d.as_secs_f64()).sum::<f64>() / total
+            } else {
+                0.0
+            };
             if floor_min >= keep * 2 {
                 // Deep backlog — the shipped guard, unchanged, no confirmation needed.
                 trim_to_keep = true;
                 trim_tag = "deadband";
-            } else if persistent >= 1 {
+            } else if deep_frac >= DEEP_FRAC_MIN {
                 // The ring held at least one whole period for all but LOW_FRAC_MAX of the
                 // window — that is backlog, however often it momentarily touches empty.
                 if floor_armed {
                     floor_strikes += 1;
                     if floor_strikes >= 2 {
                         trim_to_keep = true;
-                        trim_tag = "deadband-p10";
-                        trim_floor = persistent * keep;
+                        trim_tag = "deadband-deep";
+                        // Drop ONE period: the excess over a healthy source (which sits at
+                        // one period) is one period. If more is owed, the burst logic below
+                        // fires again next window rather than over-trimming on one guess.
+                        trim_floor = keep;
                     }
                 }
             } else {
@@ -1036,8 +1065,9 @@ fn main() {
                 .map(|d| format!("{:.0}", if total > 0.0 { d.as_secs_f64() / total * 100.0 } else { 0.0 }))
                 .collect();
             eprintln!(
-                "ardftsrc-bridge[diag window]: low={:.1}% persistent={persistent}                  strikes={floor_strikes} armed={floor_armed} bursts={trim_bursts}                  hist%=[{}] trim={}",
+                "ardftsrc-bridge[diag window]: low={:.1}% deep={:.1}% persistent={persistent}                  strikes={floor_strikes} armed={floor_armed} bursts={trim_bursts}                  hist%=[{}] trim={}",
                 if total > 0.0 { depth_hist[0].as_secs_f64() / total * 100.0 } else { 100.0 },
+                deep_frac * 100.0,
                 hist_pct.join(","),
                 if trim_to_keep { trim_tag } else { "-" }
             );
