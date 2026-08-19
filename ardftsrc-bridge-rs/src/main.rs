@@ -91,8 +91,24 @@ const LOW_FRAC_MAX: f64 = 0.05;
 /// has never been seen past ~4; 8 is headroom, and the cost is 9 `Duration` adds per window.
 const DEPTH_BUCKETS: usize = 8;
 const CAP_BUFFER: i64 = 4096;
+// ⚠ `OUT_PERIOD` is not a latency term. The blocking `writei` keeps the output PCM near
+// full, so standing latency tracks OUT_BUFFER, not the write granularity. Its only leverage
+// is that ALSA requires buffer >= 2 periods, so 1024 here is what makes 2048 the floor for
+// OUT_BUFFER. Cutting it to 512 would unlock 1536 (3 quanta) — see the note below before
+// trying that.
 const OUT_PERIOD: i64 = 1024;
-// ★ 2026-08-18 SOAK CANDIDATE: 4096 -> 3072 (6 graph quanta @96k, vs the 2 that broke).
+// ★ 2026-08-19 SOAK CANDIDATE: 3072 -> 2048 (4 graph quanta @96k, vs the 2 that broke).
+// 3072 soaked ~3 h clean across the TV and USB paths (0 trims, band stable), banking the
+// first 10.7 ms; this takes the second and last one available at OUT_PERIOD 1024.
+//
+// ⛔ Going BELOW 2048 needs OUT_PERIOD 512, and the 2026-06 regression CONFOUNDED the two:
+// it changed period and buffer together ("OUT 512/1024") and then attributed the failure to
+// the buffer — "At OUT_BUFFER 1024 (<=2 graph quanta of slack) the servo limit-cycled". The
+// averaging depth feeding PipeWire's rate-match servo IS the buffer occupancy, so that
+// attribution is probably right and OUT_PERIOD 512 with a 1536/2048 buffer has simply never
+// been tested. Worth only ~5.3 ms though, at 3 quanta against the 2 that broke, so it is
+// the last thing to try and it deserves its own soak — not a rider on this one.
+// ★ 2026-08-18 (previous): 4096 -> 3072 (6 graph quanta @96k, vs the 2 that broke).
 // Plan section 29: the bridge's `out` occupancy is a STANDING 42.6-47.9 ms reservoir and is
 // roughly HALF the 71.5 ms measured premium over an arecord|pw-cat path — recoverable with
 // no quality argument and no swap to PipeWire. The warning above still governs: the failure
@@ -100,7 +116,7 @@ const OUT_PERIOD: i64 = 1024;
 // that makes the stall guard skip periodically), and it once ran clean for 15 minutes before
 // tipping over. Hence a multi-hour soak, watching for periodic `[diag trim]` stall lines and
 // for `out=` failing to settle. Revert = /opt/vibesbox-src/bin/ardftsrc-bridge.previous.
-const OUT_BUFFER: i64 = 3072;
+const OUT_BUFFER: i64 = 2048;
 
 struct SourceCfg {
     name: &'static str,       // node becomes source.<name>.ardftsrc
@@ -436,6 +452,19 @@ fn open_pcm(
         pcm.hw_params(&hwp)?;
     }
     pcm.prepare()?;
+    // ⚠ `set_*_near` is a REQUEST, not a setting, and nothing has ever checked what came
+    // back. That matters: `out=` peaks at 3578 against a nominal 3072, which is either a
+    // grant that differs from the ask or `delay()` including graph-side buffering — and
+    // until it is known, every "OUT_BUFFER is worth N ms" claim rests on the requested
+    // number rather than the real one. Printed once per open, so it costs nothing.
+    if let Ok(cur) = pcm.hw_params_current() {
+        eprintln!(
+            "ardftsrc-bridge: {device} {} hw granted period={} buffer={} (requested {period}/{buffer})",
+            match dir { Direction::Capture => "capture", Direction::Playback => "playback" },
+            cur.get_period_size().map(|v| v.to_string()).unwrap_or_else(|_| "?".into()),
+            cur.get_buffer_size().map(|v| v.to_string()).unwrap_or_else(|_| "?".into()),
+        );
+    }
     Ok(pcm)
 }
 
