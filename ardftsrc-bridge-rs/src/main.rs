@@ -622,7 +622,10 @@ fn main() {
     // ── Bounded ring (raw f64 interleaved). Capacity ≈ 0.25 s of source audio: covers the
     //    per-block DFT compute burst AND serves as the source-vs-graph drift reservoir
     //    (its size sets the flush interval under drift). Far smaller than v2's ~950 ms. ──
-    let ring_cap = (rate as usize / 4).max(prim_samples * 2) * channels;
+    // 🐛 `prim_samples` is INTERLEAVED SAMPLES; `rate / 4` is FRAMES. Comparing them made the
+    // `max` pick 49392 at 44.1k/6ch and sized the ring 1.12 s — while the comment above claims
+    // it is "far smaller than v2's ~950 ms". It was larger. Divide to frames first.
+    let ring_cap = (rate as usize / 4).max(prim_samples / channels * 2) * channels;
     let rb = HeapRb::<f64>::new(ring_cap);
     let (mut prod, mut cons) = rb.split();
 
@@ -696,7 +699,16 @@ fn main() {
         // drop the right span (observed stuck for 10+ min, 2026-08-01).
         let mut tv_syncs: u32 = 0;
         let mut tv_gap: usize = 0;
-        const TV_SYNC_WINDOW: usize = 16384;
+        // ⛔ Was 16384 INTERLEAVED SAMPLES, and the sizing argument above ("~170 ms of real
+        // audio", DD+ spacing "12288 samples") assumed 2 samples per frame — a 2ch capture.
+        // The eARC tap went 2 -> 6 -> 8 channels, so both the window and its time-equivalent
+        // silently shrank 4x: 16384 samples is only 42.7 ms and 2048 frames at 8ch, against a
+        // DD+ preamble spacing of 6144 FRAMES. `tv_syncs` therefore always reset before
+        // reaching 2 and DD+ self-detection has been dead since the 8ch widening — the exact
+        // "latched onto DD+ playing noise" failure the 5000 -> 16384 fix once cured, silently
+        // un-fixed. In FRAMES it is channel-count-proof.
+        const TV_SYNC_WINDOW_FRAMES: usize = 8192; // ~170 ms @48k, the original intent
+        let tv_sync_window = TV_SYNC_WINDOW_FRAMES * cap_channels;
         while cap_running.load(Ordering::Relaxed) {
             let t_readi = Instant::now();
             match io.readi(&mut raw) {
@@ -731,7 +743,7 @@ fn main() {
                             tv_gap = 0;
                         } else {
                             tv_gap += samples;
-                            if tv_gap > TV_SYNC_WINDOW {
+                            if tv_gap > tv_sync_window {
                                 tv_syncs = 0;
                             }
                         }
