@@ -497,8 +497,19 @@ class SourceRouter:
         earc_probe (eARC tap): the rate MEASURED by the last probe — a slave-mode I2S
         capture carries no rate information, so it is derived from frames-per-second."""
         det = spec.get("alsa_detect") or {}
-        if det.get("earc_probe"):
-            return self._earc_rate
+        earc = det.get("earc_probe")
+        if earc:
+            # ⛔ `_earc_rate` is written ONLY by _probe_earc(), and that probe can only run
+            # while NO bridge holds hw:eARC,0 — _update_tv_bridge() early-returns as soon as
+            # one is running. So once the TV is playing the rate can never be refreshed, and
+            # after a daemon restart (or a bridge that came up first) it stays None and the
+            # UI INPUT readout shows "—" for the whole session.
+            # The bridge negotiated the rate it measured, so the kernel already publishes it:
+            # /proc/asound/<card>/pcm0c/sub0/hw_params reads "rate: 48000 (48000/1)" exactly
+            # like the snd-aloop writers do, and "closed" when idle. Prefer that; fall back to
+            # the probe's cached value for the gap between "TV on" and "bridge running".
+            return (self._hw_params_rate(f"/proc/asound/{earc}/pcm0c/sub0/hw_params")
+                    or self._earc_rate)
         usb_card = det.get("usb_card")
         if usb_card:
             return 48000 if os.path.isdir(f"/proc/asound/{usb_card}") else None
@@ -516,14 +527,20 @@ class SourceRouter:
             return None
         path = det.get("hw_params")
         if path:
-            try:
-                with open(path) as f:
-                    for line in f:
-                        if line.startswith("rate:"):     # "rate: 44100 (44100/1)"
-                            return int(line.split(":", 1)[1].split()[0])
-            except Exception:
-                pass
-            return None
+            return self._hw_params_rate(path)
+        return None
+
+    @staticmethod
+    def _hw_params_rate(path: str):
+        """Rate in Hz from an ALSA hw_params file, or None. Reads 'closed' when the
+        substream is idle, and is present only while something holds the device."""
+        try:
+            with open(path) as f:
+                for line in f:
+                    if line.startswith("rate:"):     # "rate: 44100 (44100/1)"
+                        return int(line.split(":", 1)[1].split()[0])
+        except Exception:
+            pass
         return None
 
     def _bluez_native_rate(self, dump: list):
