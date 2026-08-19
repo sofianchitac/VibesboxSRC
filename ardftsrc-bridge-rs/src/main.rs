@@ -76,9 +76,31 @@ const CAP_PERIOD: i64 = 1024;
 /// Long on purpose: it must comfortably outlast normal drain cycles so that only backlog
 /// which NEVER drains raises the floor. See the trim block in the process loop.
 const FLOOR_WINDOW: Duration = Duration::from_secs(10);
+/// Fraction of each window the ring must spend BELOW `keep` for it to count as draining.
+/// ★ This exists because the FLOOR provably cannot see a ring that sits one period high and
+/// dips to empty occasionally: one touch of zero anywhere in the window zeroes the minimum,
+/// so that state reads identical to a clean one (measured, plan section 28 — the floor-based
+/// trim recovered 21.3 ms of a ~42 ms step and then went blind to the rest). Lengthening
+/// FLOOR_WINDOW makes it strictly WORSE, since a longer window is MORE likely to contain a
+/// zero. A low percentile separates them; this is that percentile, expressed as a time
+/// fraction so it does not depend on the poll loop's cadence. Deliberately conservative at
+/// 5%: a false trip needs the ring non-empty 95% of a window, and the latch below bounds it
+/// to one trim per bridge start anyway.
+const LOW_FRAC_MAX: f64 = 0.05;
+/// How many whole capture periods of backlog the depth histogram can resolve. The ratchet
+/// has never been seen past ~4; 8 is headroom, and the cost is 9 `Duration` adds per window.
+const DEPTH_BUCKETS: usize = 8;
 const CAP_BUFFER: i64 = 4096;
 const OUT_PERIOD: i64 = 1024;
-const OUT_BUFFER: i64 = 4096;
+// ★ 2026-08-18 SOAK CANDIDATE: 4096 -> 3072 (6 graph quanta @96k, vs the 2 that broke).
+// Plan section 29: the bridge's `out` occupancy is a STANDING 42.6-47.9 ms reservoir and is
+// roughly HALF the 71.5 ms measured premium over an arecord|pw-cat path — recoverable with
+// no quality argument and no swap to PipeWire. The warning above still governs: the failure
+// mode is not an error but a SERVO LIMIT-CYCLE (audible time-stretch, plus conserved backlog
+// that makes the stall guard skip periodically), and it once ran clean for 15 minutes before
+// tipping over. Hence a multi-hour soak, watching for periodic `[diag trim]` stall lines and
+// for `out=` failing to settle. Revert = /opt/vibesbox-src/bin/ardftsrc-bridge.previous.
+const OUT_BUFFER: i64 = 3072;
 
 struct SourceCfg {
     name: &'static str,       // node becomes source.<name>.ardftsrc
@@ -757,9 +779,27 @@ fn main() {
     // the trim block below for why the PEAK cannot.
     let mut floor_min = usize::MAX;
     let mut floor_since = Instant::now();
+    // Latch + strike counter for the marginal band of the dead-band trim below. `armed`
+    // clears on a trim and only re-arms once a window proves the ring can still drain, so
+    // a ring that legitimately floors above `keep` gets exactly ONE trim per bridge start
+    // rather than one every other window.
+    let mut floor_armed = true;
+    let mut floor_strikes = 0u32;
+    let mut trim_bursts = 0u32;
+    // Time-weighted, so the statistic does not depend on how often the loop happens to poll
+    // (the empty branch spins at 500 us while the busy branch does real work per pass).
+    // Time-weighted histogram of ring depth in units of `keep`, bucket k = "between k and
+    // k+1 periods". ★ A histogram, not a scalar, because the ACTION needs a percentile too —
+    // see the trim block. depth_hist[0] alone is the old `low` statistic.
+    let mut depth_hist = [Duration::ZERO; DEPTH_BUCKETS + 1];
+    let mut window_time = Duration::ZERO;
+    let mut last_poll = Instant::now();
+    // One source of truth for the trim threshold: the in-loop `keep` binds to this, and the
+    // low-time accumulator above the early-continue needs it before that binding exists.
+    let keep_elems = CAP_PERIOD as usize * channels;
     let mut last_diag = Instant::now();
     let diag = |tag: &str, cap_f: i64, ring_samples: usize, ready_samples: usize, out_f64: i64,
-                floor_samples: usize| {
+                floor_samples: usize, low_frac: f64| {
         let cap_ms = cap_f as f64 * 1000.0 / rate as f64;
         let ring_frames = ring_samples / channels;
         let ring_ms = ring_frames as f64 * 1000.0 / rate as f64;
@@ -767,9 +807,12 @@ fn main() {
         let ready_ms = ready_frames as f64 * 1000.0 / TARGET_RATE as f64;
         let out_ms = out_f64 as f64 * 1000.0 / TARGET_RATE as f64;
         let floor_frames = if floor_samples == usize::MAX { 0 } else { floor_samples / channels };
+        // Share of the window so far spent with the ring below one capture period. The trim
+        // acts on this, not on the floor — see LOW_FRAC_MAX.
+        let low_pct = low_frac * 100.0;
         eprintln!(
             "ardftsrc-bridge[diag {tag}]: cap={cap_f}f({cap_ms:.1}ms) ring={ring_frames}f({ring_ms:.1}ms) \
-             floor={floor_frames}f \
+             floor={floor_frames}f low={low_pct:.0}% \
              rs~{group_ms:.1}ms ready={ready_frames}f({ready_ms:.1}ms) out={out_f64}f({out_ms:.1}ms) sum~{:.1}ms",
             cap_ms + ring_ms + group_ms + ready_ms + out_ms
         );
@@ -781,6 +824,13 @@ fn main() {
         // 0 <-> one period, and its floor IS the zero. Sampling only the non-empty passes
         // would make every state look permanently backlogged.
         floor_min = floor_min.min(avail);
+        {
+            let now = Instant::now();
+            let dt = now.duration_since(last_poll);
+            last_poll = now;
+            window_time += dt;
+            depth_hist[(avail / keep_elems).min(DEPTH_BUCKETS)] += dt;
+        }
         if avail == 0 {
             thread::sleep(Duration::from_micros(500));
             continue;
@@ -798,9 +848,11 @@ fn main() {
         //        restart pinned the ring at ~557 ms live 2026-06-10. Normal post-trim
         //        slack re-locks at 2-4 periods (resampler chunk quantization), so 8x
         //        with the sustained-1s filter never trips in steady state. ──
-        let keep = CAP_PERIOD as usize * channels;
+        let keep = keep_elems;
         let mut trim_to_keep = false;
         let mut trim_tag = "startup";
+        // The window's floor, captured for the p10 trim's ACTION (see the trim block).
+        let mut trim_floor = 0usize;
         if !startup_trimmed && first_write_done && t_start.elapsed() >= Duration::from_secs(2) {
             startup_trimmed = true;
             trim_to_keep = avail > keep;
@@ -833,19 +885,129 @@ fn main() {
         //        clean state never reaches. Each trim costs one brief audible skip, so this
         //        must fire once per stall event, not continuously: the window resets after
         //        every trim, and post-trim the floor returns to 0. ──
+        //        ★ 2026-08-18 (later): `keep * 2` was ONE PERIOD TOO HIGH for the ratchet
+        //        actually seen in the field. Measured live on @lyrion: ring pinned at
+        //        2048 frames, sum~148 ms against a clean ~105 — and `floor=` bouncing
+        //        1024 <-> 2048, so any window containing a 1024 sample held the trim off
+        //        and the backlog stayed permanent. The clean state floors at 0, so `keep`
+        //        already carries the full margin; what `keep * 2` bought was not margin
+        //        but insensitivity. Two bands now:
+        //            floor >= keep*2  -> trim after ONE window   (the shipped behaviour,
+        //                                unchanged: deep backlog needs no confirmation)
+        //            floor >= keep    -> trim after TWO windows  (new: the marginal band,
+        //                                confirmed before acting)
+        //        and the marginal band is LATCHED. A source whose ring legitimately floors
+        //        above `keep` forever would otherwise be trimmed every other window, one
+        //        audible skip each; with the latch it is trimmed once and then needs a
+        //        window that drops below `keep` — proof the ring can still drain — before
+        //        it can fire again. That is what makes this once-per-stall rather than a
+        //        periodic tick, which is the property the 8x guard was protecting. ──
         if !trim_to_keep && first_write_done && floor_since.elapsed() >= FLOOR_WINDOW {
+            // How many whole periods the ring holds for all but LOW_FRAC_MAX of the window.
+            // ⛔⛔ This replaces BOTH the floor-as-statistic and the floor-as-action, and it
+            // replaces them for the SAME reason: a momentary touch of zero destroys a
+            // minimum. Measured live — in the ratcheted state the ring dips empty for 1–2%
+            // of the window, so `floor` reads 0 while the ring genuinely holds a full period
+            // 98% of the time. The floor-based ACTION therefore dropped 0f three times in a
+            // row and the path stayed ratcheted (plan section 28c). A percentile survives the
+            // dip; a minimum cannot.
+            let total = window_time.as_secs_f64();
+            let mut persistent = 0usize; // in units of `keep`
+            if total > 0.0 {
+                let mut cum = 0.0;
+                for k in 0..=DEPTH_BUCKETS {
+                    cum += depth_hist[k].as_secs_f64();
+                    if cum / total >= LOW_FRAC_MAX {
+                        break;
+                    }
+                    persistent = k + 1;
+                }
+            }
             if floor_min >= keep * 2 {
+                // Deep backlog — the shipped guard, unchanged, no confirmation needed.
                 trim_to_keep = true;
                 trim_tag = "deadband";
+            } else if persistent >= 1 {
+                // The ring held at least one whole period for all but LOW_FRAC_MAX of the
+                // window — that is backlog, however often it momentarily touches empty.
+                if floor_armed {
+                    floor_strikes += 1;
+                    if floor_strikes >= 2 {
+                        trim_to_keep = true;
+                        trim_tag = "deadband-p10";
+                        trim_floor = persistent * keep;
+                    }
+                }
+            } else {
+                // It genuinely drains — re-arm and forget the burst count.
+                floor_armed = true;
+                floor_strikes = 0;
+                trim_bursts = 0;
+            }
+            // ★ 2026-08-18: log the WINDOW-CLOSE DECISION, not just the 5 s samples.
+            // Three iterations of this trim were designed by inferring the window state from
+            // `diag 5s` lines — but those are sampled mid-window, so `low=` there is a
+            // partial cumulative figure and NOT the value the trim actually tested. Two of
+            // the three iterations were wrong, and this is the missing instrument: it prints
+            // exactly what the decision saw. Do not tune LOW_FRAC_MAX or the strike rule
+            // from `diag 5s` again.
+            let hist_pct: Vec<String> = depth_hist
+                .iter()
+                .take(4)
+                .map(|d| format!("{:.0}", if total > 0.0 { d.as_secs_f64() / total * 100.0 } else { 0.0 }))
+                .collect();
+            eprintln!(
+                "ardftsrc-bridge[diag window]: low={:.1}% persistent={persistent}                  strikes={floor_strikes} armed={floor_armed} bursts={trim_bursts}                  hist%=[{}] trim={}",
+                if total > 0.0 { depth_hist[0].as_secs_f64() / total * 100.0 } else { 100.0 },
+                hist_pct.join(","),
+                if trim_to_keep { trim_tag } else { "-" }
+            );
+
+            if trim_to_keep {
+                floor_strikes = 0;
+                // ★ Do NOT disarm after a single trim. Dropping the floor is provably
+                // productive, but ONE drop only removes one window's worth of never-consumed
+                // backlog — a deeper ratchet needs several. Disarming after the first left the
+                // path stuck (measured, plan section 28b: it fired once, dropped nothing, and
+                // could never re-arm because `low` stays 0% while backlogged). Bound the burst
+                // instead: up to 3 consecutive trims, then insist on a window that genuinely
+                // drains before arming again, so a pathological source cannot skip forever.
+                trim_bursts += 1;
+                if trim_bursts >= 3 {
+                    floor_armed = false;
+                }
             }
             floor_min = usize::MAX;
+            depth_hist = [Duration::ZERO; DEPTH_BUCKETS + 1];
+            window_time = Duration::ZERO;
             floor_since = Instant::now();
         }
 
         if trim_to_keep {
             floor_min = usize::MAX;
             floor_since = Instant::now();
-            let mut drop_left = avail - keep;
+            // ⛔⛔ THE TARGET IS NOT ALWAYS `keep`. Trimming down to `keep` is right for the
+            // startup and deep-stall cases, where the ring is far above it. It is USELESS for
+            // the dead-band case, and this cost a run: the ratcheted ring oscillates between
+            // `keep` and 2*keep, so a trim landing on the low phase computes `avail - keep`
+            // = 0 and drops nothing — logged live as `dropped 0f (0.0ms) of deadband-p10`.
+            // What is actually backlogged there is the FLOOR: the part the ring provably never
+            // consumed all window. So the dead-band trim drops the floor, which is exactly the
+            // quantity its statistic identified, and leaves the oscillation intact.
+            // saturating_sub because `avail` is instantaneous and can sit BELOW `keep` at the
+            // moment the window closes — plain subtraction wraps in release and drains the
+            // whole ring.
+            let mut drop_left = if trim_floor > 0 {
+                // `trim_floor` is the PERSISTENT depth (whole periods held for all but
+                // LOW_FRAC_MAX of the window), not the floor and not the instantaneous
+                // excess. Capped at `avail` because the trim can land on the low phase of
+                // the oscillation — that cap is why this drops something at all.
+                trim_floor.min(avail)
+            } else {
+                avail.saturating_sub(keep)
+            };
+            // Whole frames only — a partial frame would rotate the channel mapping.
+            drop_left -= drop_left % channels;
             let dropped = drop_left;
             while drop_left > 0 {
                 let got = cons.pop_slice(&mut in_buf[..drop_left.min(pop_cap)]);
@@ -930,6 +1092,7 @@ fn main() {
                 rs.num_samples_ready(),
                 out_pcm.delay().unwrap_or(-1),
                 floor_min,
+                if window_time.is_zero() { 1.0 } else { depth_hist[0].as_secs_f64() / window_time.as_secs_f64() },
             );
         } else if first_write_done && last_diag.elapsed() >= Duration::from_secs(5) {
             last_diag = Instant::now();
@@ -940,6 +1103,7 @@ fn main() {
                 rs.num_samples_ready(),
                 out_pcm.delay().unwrap_or(-1),
                 floor_min,
+                if window_time.is_zero() { 1.0 } else { depth_hist[0].as_secs_f64() / window_time.as_secs_f64() },
             );
         }
     }
