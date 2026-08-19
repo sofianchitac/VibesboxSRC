@@ -128,6 +128,28 @@ const DEEP_FRAC_MIN: f64 = 0.25;
 /// How many whole capture periods of backlog the depth histogram can resolve. The ratchet
 /// has never been seen past ~4; 8 is headroom, and the cost is 9 `Duration` adds per window.
 const DEPTH_BUCKETS: usize = 8;
+
+// ── Fine ring-depth statistic (2026-08-20). PURELY AN INSTRUMENT — it feeds no decision. ──
+//
+// ⛔ The trim's own histogram is bucketed in `TRIM_UNIT` (1024 frames), so it cannot resolve
+// anything finer than 21.3 ms @48k, and `ring=` on the diag line is ONE INSTANTANEOUS SAMPLE
+// of a sawtooth — which is why it only ever prints exact multiples of the capture quantum.
+// Two failures traced to exactly that:
+//   1. `@tv` parks at 1792 frames = 1.75 `TRIM_UNIT`s, so a trigger counting time at >=2 never
+//      fires while the path holds a permanent 37.3 ms. The trim is blind there by CONSTRUCTION,
+//      and that is a resolution limit, not a threshold choice.
+//   2. Two probe runs whose SAMPLED `ring`+`out` matched exactly measured 7.6 ms apart. A point
+//      sample of a sawtooth is not its mean, so that comparison could never have been valid —
+//      and a whole hypothesis about a varying constant term was built on it.
+// This records the time-weighted DISTRIBUTION in frames, so p10/p50/p90 are readable and the
+// sawtooth's shape is visible (a ring alternating 0<->2048 and one parked at 1024 have the same
+// mean and very different p10/p90).
+//
+// ⚠ DELIBERATELY does not touch the trigger. The standing rule in this file is to change the
+// instrument and the threshold in separate steps; every wrong conclusion here came from moving
+// two things at once. Read this for a few days BEFORE proposing a new trim statistic.
+const RING_HIST_UNIT: usize = 128;    // frames per bucket — 2.7 ms @48k, 1/8 of TRIM_UNIT
+const RING_HIST_BUCKETS: usize = 48;  // 0..6144 frames; the last bucket is an overflow catch-all
 const CAP_BUFFER: i64 = 4096;
 // ⚠ `OUT_PERIOD` is not a latency term. The blocking `writei` keeps the output PCM near
 // full, so standing latency tracks OUT_BUFFER, not the write granularity. Its only leverage
@@ -188,6 +210,27 @@ const MEASURE_WINDOW: Duration = Duration::from_millis(500);
 // specific target (not merely "not the current rate") is what stops a stall storm from
 // walking the bridge onto a wrong rate and reintroducing wrong-pitch playback.
 const RATE_CHANGE_WINDOWS: u32 = 3;
+
+/// Time-weighted percentile of a ring-depth histogram, returned in FRAMES.
+///
+/// `hist[k]` is the time the ring spent holding between `k*unit` and `(k+1)*unit` frames, so the
+/// answer is reported at the bucket's MIDPOINT — the bucket is the resolution, and claiming its
+/// lower edge would bias every reading low by half a bucket.
+fn ring_pct(hist: &[Duration], unit: usize, q: f64) -> usize {
+    let total: f64 = hist.iter().map(|d| d.as_secs_f64()).sum();
+    if total <= 0.0 {
+        return 0;
+    }
+    let target = total * q;
+    let mut cum = 0.0;
+    for (k, d) in hist.iter().enumerate() {
+        cum += d.as_secs_f64();
+        if cum >= target {
+            return k * unit + unit / 2;
+        }
+    }
+    (hist.len() - 1) * unit
+}
 
 /// Snap a measured frame rate onto a standard rate. None when it is not within
 /// RATE_TOLERANCE of any of them — a stall, a startup transient, or a genuinely exotic
@@ -883,6 +926,8 @@ fn main() {
     // k+1 periods". ★ A histogram, not a scalar, because the ACTION needs a percentile too —
     // see the trim block. depth_hist[0] alone is the old `low` statistic.
     let mut depth_hist = [Duration::ZERO; DEPTH_BUCKETS + 1];
+    // Fine time-weighted ring-depth distribution, in RING_HIST_UNIT frames. See the consts.
+    let mut ring_hist = [Duration::ZERO; RING_HIST_BUCKETS + 1];
     let mut window_time = Duration::ZERO;
     let mut last_poll = Instant::now();
     // One source of truth for the trim threshold: the in-loop `keep` binds to this, and the
@@ -927,6 +972,7 @@ fn main() {
             last_poll = now;
             window_time += dt;
             depth_hist[(avail / keep_elems).min(DEPTH_BUCKETS)] += dt;
+            ring_hist[(avail / channels / RING_HIST_UNIT).min(RING_HIST_BUCKETS)] += dt;
         }
         if avail == 0 {
             thread::sleep(Duration::from_micros(500));
@@ -1064,11 +1110,22 @@ fn main() {
                 .take(4)
                 .map(|d| format!("{:.0}", if total > 0.0 { d.as_secs_f64() / total * 100.0 } else { 0.0 }))
                 .collect();
+            // ★ The fine ring distribution, in FRAMES and in ms. This is the statistic to read
+            // — `ring=` on the 5 s line is a point sample of a sawtooth and p50 is not it.
+            // p10/p90 together show the sawtooth's SHAPE: a ring alternating 0<->2048 and one
+            // parked at 1024 share a mean but differ completely here.
+            let (p10, p50, p90) = (
+                ring_pct(&ring_hist, RING_HIST_UNIT, 0.10),
+                ring_pct(&ring_hist, RING_HIST_UNIT, 0.50),
+                ring_pct(&ring_hist, RING_HIST_UNIT, 0.90),
+            );
+            let f2ms = |f: usize| f as f64 * 1000.0 / rate as f64;
             eprintln!(
-                "ardftsrc-bridge[diag window]: low={:.1}% deep={:.1}% persistent={persistent}                  strikes={floor_strikes} armed={floor_armed} bursts={trim_bursts}                  hist%=[{}] trim={}",
+                "ardftsrc-bridge[diag window]: low={:.1}% deep={:.1}% persistent={persistent}                  strikes={floor_strikes} armed={floor_armed} bursts={trim_bursts}                  hist%=[{}] ringp10/50/90={p10}/{p50}/{p90}f({:.1}/{:.1}/{:.1}ms) trim={}",
                 if total > 0.0 { depth_hist[0].as_secs_f64() / total * 100.0 } else { 100.0 },
                 deep_frac * 100.0,
                 hist_pct.join(","),
+                f2ms(p10), f2ms(p50), f2ms(p90),
                 if trim_to_keep { trim_tag } else { "-" }
             );
 
@@ -1088,6 +1145,7 @@ fn main() {
             }
             floor_min = usize::MAX;
             depth_hist = [Duration::ZERO; DEPTH_BUCKETS + 1];
+            ring_hist = [Duration::ZERO; RING_HIST_BUCKETS + 1];
             window_time = Duration::ZERO;
             floor_since = Instant::now();
         }
@@ -1230,6 +1288,43 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The distinction the fine histogram exists to make: a ring PARKED at one depth and a ring
+    /// OSCILLATING around it have the same mean, and `ring=` on the 5 s line cannot tell them
+    /// apart because it samples one point of the sawtooth. p10/p90 separate them.
+    #[test]
+    fn ring_pct_separates_a_parked_ring_from_an_oscillating_one() {
+        let unit = RING_HIST_UNIT; // 128 frames
+        let mut parked = [Duration::ZERO; RING_HIST_BUCKETS + 1];
+        parked[8] = Duration::from_secs(10); // all 10 s between 1024 and 1151 frames
+        let mut swinging = [Duration::ZERO; RING_HIST_BUCKETS + 1];
+        swinging[0] = Duration::from_secs(5); // half the window empty
+        swinging[16] = Duration::from_secs(5); // half at ~2048
+
+        // Same p50 bucket region is NOT the point — the spread is.
+        assert_eq!(ring_pct(&parked, unit, 0.10), 8 * unit + unit / 2);
+        assert_eq!(ring_pct(&parked, unit, 0.90), 8 * unit + unit / 2);
+        assert_eq!(ring_pct(&swinging, unit, 0.10), unit / 2);
+        assert_eq!(ring_pct(&swinging, unit, 0.90), 16 * unit + unit / 2);
+    }
+
+    /// The `@tv` case the trim is blind to: parked at 1792 frames = 1.75 TRIM_UNITs. The fine
+    /// statistic must report it plainly, which is the whole reason it exists.
+    #[test]
+    fn ring_pct_sees_the_tv_parked_depth_the_trim_misses() {
+        let mut tv = [Duration::ZERO; RING_HIST_BUCKETS + 1];
+        tv[1792 / RING_HIST_UNIT] = Duration::from_secs(10);
+        let p50 = ring_pct(&tv, RING_HIST_UNIT, 0.50);
+        assert!((1792..1792 + RING_HIST_UNIT).contains(&p50), "p50 was {p50}");
+        // …while the trim's own bucketing rounds it down to 1 whole TRIM_UNIT, i.e. "not deep".
+        assert_eq!(1792 / TRIM_UNIT as usize, 1);
+    }
+
+    #[test]
+    fn ring_pct_is_empty_safe() {
+        let empty = [Duration::ZERO; RING_HIST_BUCKETS + 1];
+        assert_eq!(ring_pct(&empty, RING_HIST_UNIT, 0.5), 0);
+    }
 
     #[test]
     fn snap_accepts_standard_rates_and_small_error() {
