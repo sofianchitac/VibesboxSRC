@@ -13,7 +13,26 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # Same algorithm as librempeg's ardftsrc filter, native Rust. NEON FFT is on by
 # default (Pi 4B Cortex-A72). Pinned for reproducibility on the appliance.
-ardftsrc = "0.0.15"
+#
+# 0.0.15 -> 0.0.16 (2026-08-19): for one fix, `clamp diverging edge extrapolation
+# before it overflows the DFT`. An unstable Burg fit on an ill-conditioned
+# near-silent seed makes the LPC prediction recursion diverge exponentially, and
+# the old per-sample is_finite guard only zeroed values AFTER they overflowed, so
+# predictions could reach ~1e308 while still finite.
+#
+# That lands on a path this bridge runs on EVERY start: `synthesize_start_context`
+# calls `extrapolate_backward`, which is implemented by reversing and calling
+# `extrapolate_forward` — where the clamp went. A near-silent fade-in reversed is
+# exactly the geometric-growth seed the upstream regression test pins, and our
+# sources routinely start near-silent. (The tail path is out of scope: this bridge
+# never calls `finalize`.)
+#
+# Consequence if it fired here, checked against this crate's own `f64_to_i32`:
+# NaN -> 0, but 1e308 -> 2147483647. Since the bug produces huge-but-finite values
+# before anything becomes NaN, a diverged start context lands as a FULL-SCALE
+# click, not a dropout. Upstream states stable fits are byte-identical, so there
+# is no audio-quality change. The other two commits in 0.0.16 add opt-in tapers.
+ardftsrc = "0.0.16"
 # ALSA capture (hw:<dev>) and the "pipewire" output PCM. Only gate1_output and the
 # bridge use this; gate2_throughput is pure CPU and does not.
 alsa = "0.9"
