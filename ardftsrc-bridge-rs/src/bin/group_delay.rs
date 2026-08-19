@@ -18,19 +18,22 @@ fn main() {
     let in_sr: usize = a.get(1).map(|s| s.parse().unwrap()).unwrap_or(44100);
     let out_sr: usize = a.get(2).map(|s| s.parse().unwrap()).unwrap_or(96000);
     let ch: usize = a.get(3).map(|s| s.parse().unwrap()).unwrap_or(1);
+    // 4th arg overrides quality, to map the hold against the ONE knob that controls it.
+    let quality: usize = a.get(4).map(|s| s.parse().unwrap()).unwrap_or(PRESET_GOOD.quality);
 
     let cfg = PRESET_GOOD
         .with_input_rate(in_sr)
         .with_output_rate(out_sr)
-        .with_channels(ch);
+        .with_channels(ch)
+        .with_quality(quality);
     let mut rs = RealtimeResampler::<f64>::new(cfg).expect("resampler");
 
     let prim = rs.estimate_priming_samples();
-    println!("in={in_sr} out={out_sr} ch={ch} quality={}", PRESET_GOOD.quality);
+    println!("in={in_sr} out={out_sr} ch={ch} quality={quality}");
     println!("estimate_priming_samples() = {prim} interleaved samples = {} frames = {:.2} ms",
              prim / ch, (prim / ch) as f64 * 1000.0 / in_sr as f64);
     println!("  bridge's rs~ term (prim/2/ch)          = {:.2} ms", (prim / 2 / ch) as f64 * 1000.0 / in_sr as f64);
-    println!("  crate doc formula  (quality/2 / fs)    = {:.2} ms", (PRESET_GOOD.quality as f64 / 2.0) * 1000.0 / in_sr as f64);
+    println!("  crate doc formula  (quality/2 / fs)    = {:.2} ms", (quality as f64 / 2.0) * 1000.0 / in_sr as f64);
 
     // ⛔ An impulse test measures STREAM ALIGNMENT, not latency, and reads 0.00 ms: output
     // frame N corresponds to input time N/out_sr because the priming period emits silence
@@ -75,5 +78,5 @@ fn main() {
     println!();
     println!(">>> STEADY-STATE in-flight hold: mean {mean:.2} ms  (min {mn:.2}, max {mx:.2}, n={})", settled.len());
     println!("    bridge `rs~` claims {:.2} ms", (prim / 2 / ch) as f64 * 1000.0 / in_sr as f64);
-    println!("    crate doc claims    {:.2} ms", (PRESET_GOOD.quality as f64 / 2.0) * 1000.0 / in_sr as f64);
+    println!("    crate doc claims    {:.2} ms", (quality as f64 / 2.0) * 1000.0 / in_sr as f64);
 }
