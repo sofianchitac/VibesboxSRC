@@ -150,6 +150,25 @@ const DEPTH_BUCKETS: usize = 8;
 // two things at once. Read this for a few days BEFORE proposing a new trim statistic.
 const RING_HIST_UNIT: usize = 128;    // frames per bucket — 2.7 ms @48k, 1/8 of TRIM_UNIT
 const RING_HIST_BUCKETS: usize = 48;  // 0..6144 frames; the last bucket is an overflow catch-all
+
+// ── Fine READY-depth statistic (2026-08-20). Also purely an instrument. ──
+//
+// ⛔ Added together with the output-cadence loop, and it is not optional decoration: that loop
+// stops the ring from holding a chunk, and the ONLY other place the same audio can sit is the
+// resampler's own output FIFO. Without this, `ringp50` falling proves nothing — a real saving
+// and a pure relocation of the queue look identical. Read the two percentiles as a PAIR:
+//     ringp50 down AND readyp50 flat  -> the chunk really left the pipeline
+//     ringp50 down AND readyp50 up    -> it only moved somewhere with no trim path
+// ⌀ Unlike `rs~` (a modelled constant standing in for a sawtooth — ledger section 6.6), this is a
+// direct occupancy query, so it is a legitimate number to attribute from.
+// In OUTPUT frames at TARGET_RATE, because that is what `num_samples_ready` counts.
+// ⚠ THE RANGE IS TIED TO `ingest_high_water` (one DFT block + one output period, computed in the
+// process loop). The widest ceiling is the 44.1k arm at ~5500 frames; this covers 2x that, so the
+// percentiles stay READABLE rather than pinning in the overflow bucket. An instrument that
+// saturates exactly where the gate binds cannot answer the saving-vs-relocation question it exists
+// for. If the gate ceiling ever rises, raise this with it.
+const READY_HIST_UNIT: usize = 128;   // 1.3 ms @96k
+const READY_HIST_BUCKETS: usize = 96; // 0..12288 frames (128 ms) — ~2x the widest gate ceiling
 const CAP_BUFFER: i64 = 4096;
 // ⚠ `OUT_PERIOD` is not a latency term. The blocking `writei` keeps the output PCM near
 // full, so standing latency tracks OUT_BUFFER, not the write granularity. Its only leverage
@@ -157,6 +176,13 @@ const CAP_BUFFER: i64 = 4096;
 // OUT_BUFFER. Cutting it to 512 would unlock 1536 (3 quanta) — see the note below before
 // trying that.
 const OUT_PERIOD: i64 = 1024;
+/// Slack above one DFT block that the resampler's output FIFO may hold before ingest is gated.
+///
+/// ⚠ PINNED, deliberately not derived from `OUT_PERIOD`, so an `OUT_PERIOD` A/B varies the output
+/// side ONLY. Derived, it would quietly move the ingest gate too and the rung would stop being one
+/// variable. 1024 is the value in force when this loop was first measured, so the baseline binary
+/// is behaviourally identical either way.
+const INGEST_SLACK: usize = 1024;
 // ★ 2026-08-19 SOAK CANDIDATE: 3072 -> 2048 (4 graph quanta @96k, vs the 2 that broke).
 // 3072 soaked ~3 h clean across the TV and USB paths (0 trims, band stable), banking the
 // first 10.7 ms; this takes the second and last one available at OUT_PERIOD 1024.
@@ -230,6 +256,16 @@ fn ring_pct(hist: &[Duration], unit: usize, q: f64) -> usize {
         }
     }
     (hist.len() - 1) * unit
+}
+
+/// Frames to hand to one `writei`: never more than the output PCM already has space for, never
+/// more than one period, never more than the resampler has ready.
+///
+/// ⛔ The bound on `avail_frames` is the whole point of the output-cadence loop — a write that
+/// exceeds the space ALSA reports BLOCKS for the difference, and the input arriving during that
+/// block is exactly the ring depth the loop exists to remove (ledger section 5b).
+fn out_chunk_frames(avail_frames: usize, period_frames: usize, ready_frames: usize) -> usize {
+    avail_frames.min(period_frames).min(ready_frames)
 }
 
 /// Snap a measured frame rate onto a standard rate. None when it is not within
@@ -655,6 +691,18 @@ fn main() {
             std::process::exit(3);
         }
     };
+    // The output-cadence loop wakes on output space, so its granularity is the period the driver
+    // actually GRANTED — not `OUT_PERIOD`, which `set_period_size_near` only ever REQUESTS. That
+    // gap is already flagged in `open_pcm`, and hardcoding a frame count here would rebuild the
+    // same untested assumption in the one place the loop now depends on it.
+    let out_period_frames = out_pcm
+        .hw_params_current()
+        .and_then(|p| p.get_period_size())
+        .map(|v| v.max(1) as usize)
+        .unwrap_or(OUT_PERIOD as usize);
+    // Smallest write worth waking for: half a granted period. Below this the loop would spin on
+    // partial writes that barely shorten the queue, and each pass still costs an `avail_update`.
+    let min_out_write = (out_period_frames / 2).max(1);
 
     // ── Resampler (2026-06-10: RealtimeResampler push/pull API, replacing the chunk API).
     //    The chunk API forced the process loop to hoard a full quality-sized chunk (~43 ms
@@ -889,13 +937,29 @@ fn main() {
         }
     });
 
-    // ── Process loop: drain whatever capture has produced into the resampler, then write
-    //    out everything it has ready. The blocking writei into the "pipewire" PCM paces
-    //    the loop to the 96k graph clock. Unlike the chunk API there is no input hoarding:
-    //    the ring holds only scheduling slack (one writei-block worth). ──
+    // ── Process loop: drive from the output side at the output cadence. ──
+    // Each pass: wait for the output PCM to have at least `min_out_write` frames of space, ingest
+    // whatever capture has produced, and write a BOUNDED chunk (never more than the space ALSA
+    // already reports). Because a write never exceeds available space, `writei` never blocks for a
+    // whole resampler chunk, so the input arriving during that block — which IS the ring depth,
+    // ledger section 5b — never accumulates. Ring holds scheduling slack (~one period) instead of
+    // ~39 ms of chunk at 48k.
+    //
+    // ⛔⛔ THE INGEST IS HIGH-WATER GATED, AND REMOVING THAT GATE SILENTLY DISABLES ALL THREE TRIMS.
+    // Every trim below reads `cons.occupied_len()`. An ungated "pop whatever the ring holds" runs on
+    // every pass INCLUDING the ones where the output is stalled and we are about to wait, so the ring
+    // can never hold backlog: the startup one-shot finds nothing, the 8x stall guard never trips, and
+    // `deep_frac` reads ~0 forever so the dead-band trim takes its "it genuinely drains" branch every
+    // window. The backlog is not gone — it is in the resampler's output FIFO, which has NO drop path
+    // at all, and `ringp50` cannot see it. The gate is a HIGH-water mark, never a low-water one: a
+    // low-water mark ("only feed when ready is low") would hold ingest off for the several passes it
+    // takes to drain one emitted block, pushing the queue straight back into the ring and giving up
+    // the entire saving. A high-water mark is inactive in steady state by construction — so it cannot
+    // confound the measurement — and during a stall it keeps backlog in the ring, where the existing,
+    // thrice-iterated trims already work. ──
     let pop_cap = TRIM_UNIT as usize * channels * 4; // unchanged by the CAP_PERIOD A/B
     let mut in_buf = vec![0.0f64; pop_cap];
-    let out_cap = OUT_PERIOD as usize * channels * 4;
+    let out_cap = out_period_frames * channels * 4;
     let mut out_f = vec![0.0f64; out_cap];
     let mut out_i = vec![0i32; out_cap];
     // Partial-frame remainder, in case read_samples() ever returns a count that is not a
@@ -905,6 +969,26 @@ fn main() {
     // LATENCY DIAGNOSTIC (temporary, 2026-06-10): decompose the bridge's in-flight audio.
     // One line after the first block lands, then a report every 5 s.
     let group_ms = (prim_samples / 2 / channels) as f64 * 1000.0 / rate as f64;
+    // One DFT block, expressed in OUTPUT frames — the unit the resampler emits in, and the unit
+    // `num_samples_ready` counts. `estimate_priming_samples` is ~2 blocks of interleaved input.
+    let block_out_frames =
+        ((prim_samples / 2 / channels).max(1) as u64 * TARGET_RATE as u64 / rate as u64).max(1) as usize;
+    // Ceiling on the resampler's output FIFO: ONE block plus one output period of slack.
+    //
+    // ⛔ Sized DOWN from a first attempt at three blocks, which was wrong in the way this whole file
+    // keeps being wrong — it moved the reservoir instead of removing it. The FIFO has no drop path,
+    // so every frame the gate permits is untrimmable latency: three blocks is ~117 ms at 48k, and an
+    // unbounded pop on top of that reaches ~203 ms. Worse, it binds on EVERY BRIDGE START — the
+    // startup one-shot below exists to drop the 2-5 capture periods (43-107 ms) of graph-link
+    // residue, and a ceiling that deep swallows all of it before the ring ever sees it, so the trim
+    // drops nothing and the residue becomes permanent. The measurement protocol restarts the bridge
+    // for every run, so that would have contaminated every number taken.
+    //
+    // Steady-state peak is exactly one block: the resampler emits a whole block at once and we drain
+    // it over the following passes. One period of slack keeps the gate off the boundary. If it binds
+    // for the odd pass in steady state that is the CORRECT outcome, not a defect — the excess lands
+    // in the ring, which is the one place the trims can reach.
+    let ingest_high_water = block_out_frames + INGEST_SLACK;
     let t_start = Instant::now();
     let mut first_write_done = false;
     let mut startup_trimmed = false;
@@ -928,6 +1012,9 @@ fn main() {
     let mut depth_hist = [Duration::ZERO; DEPTH_BUCKETS + 1];
     // Fine time-weighted ring-depth distribution, in RING_HIST_UNIT frames. See the consts.
     let mut ring_hist = [Duration::ZERO; RING_HIST_BUCKETS + 1];
+    // Fine time-weighted distribution of the RESAMPLER'S OUTPUT FIFO. Read as a pair with
+    // ring_hist — see READY_HIST_UNIT for why neither means anything alone under this loop.
+    let mut ready_hist = [Duration::ZERO; READY_HIST_BUCKETS + 1];
     let mut window_time = Duration::ZERO;
     let mut last_poll = Instant::now();
     // One source of truth for the trim threshold: the in-loop `keep` binds to this, and the
@@ -962,10 +1049,13 @@ fn main() {
 
     'process: while running.load(Ordering::Relaxed) {
         let avail = cons.occupied_len();
-        // ⚠ BEFORE the empty-ring early-continue, on purpose: a healthy ring alternates
-        // 0 <-> one period, and its floor IS the zero. Sampling only the non-empty passes
+        // Sampled at the TOP, before the trim and before the ingest, on purpose: a healthy ring
+        // alternates 0 <-> one period and its floor IS the zero, so skipping the empty passes
         // would make every state look permanently backlogged.
         floor_min = floor_min.min(avail);
+        // One query per pass, reused by the histogram AND by the ingest gate below — nothing
+        // between here and there touches the resampler.
+        let ready_frames_now = rs.num_samples_ready() / channels;
         {
             let now = Instant::now();
             let dt = now.duration_since(last_poll);
@@ -973,10 +1063,7 @@ fn main() {
             window_time += dt;
             depth_hist[(avail / keep_elems).min(DEPTH_BUCKETS)] += dt;
             ring_hist[(avail / channels / RING_HIST_UNIT).min(RING_HIST_BUCKETS)] += dt;
-        }
-        if avail == 0 {
-            thread::sleep(Duration::from_micros(500));
-            continue;
+            ready_hist[(ready_frames_now / READY_HIST_UNIT).min(READY_HIST_BUCKETS)] += dt;
         }
 
         // ── Backlog trims. In-flight audio is CONSERVED in this pipeline (input and
@@ -1120,12 +1207,23 @@ fn main() {
                 ring_pct(&ring_hist, RING_HIST_UNIT, 0.90),
             );
             let f2ms = |f: usize| f as f64 * 1000.0 / rate as f64;
+            // ★ The resampler's output FIFO over the SAME window. Under the output-cadence loop this
+            // is the only other place a chunk can sit, so a fall in `ringp50` is only a real saving
+            // if `readyp50` holds — see READY_HIST_UNIT. Reported here and not only on the 5 s line
+            // because ledger section 6.1 forbids attributing from a mid-window point sample.
+            let (rdy10, rdy50, rdy90) = (
+                ring_pct(&ready_hist, READY_HIST_UNIT, 0.10),
+                ring_pct(&ready_hist, READY_HIST_UNIT, 0.50),
+                ring_pct(&ready_hist, READY_HIST_UNIT, 0.90),
+            );
+            let o2ms = |f: usize| f as f64 * 1000.0 / TARGET_RATE as f64;
             eprintln!(
-                "ardftsrc-bridge[diag window]: low={:.1}% deep={:.1}% persistent={persistent}                  strikes={floor_strikes} armed={floor_armed} bursts={trim_bursts}                  hist%=[{}] ringp10/50/90={p10}/{p50}/{p90}f({:.1}/{:.1}/{:.1}ms) trim={}",
+                "ardftsrc-bridge[diag window]: low={:.1}% deep={:.1}% persistent={persistent}                  strikes={floor_strikes} armed={floor_armed} bursts={trim_bursts}                  hist%=[{}] ringp10/50/90={p10}/{p50}/{p90}f({:.1}/{:.1}/{:.1}ms)                  readyp10/50/90={rdy10}/{rdy50}/{rdy90}f({:.1}/{:.1}/{:.1}ms) trim={}",
                 if total > 0.0 { depth_hist[0].as_secs_f64() / total * 100.0 } else { 100.0 },
                 deep_frac * 100.0,
                 hist_pct.join(","),
                 f2ms(p10), f2ms(p50), f2ms(p90),
+                o2ms(rdy10), o2ms(rdy50), o2ms(rdy90),
                 if trim_to_keep { trim_tag } else { "-" }
             );
 
@@ -1146,6 +1244,7 @@ fn main() {
             floor_min = usize::MAX;
             depth_hist = [Duration::ZERO; DEPTH_BUCKETS + 1];
             ring_hist = [Duration::ZERO; RING_HIST_BUCKETS + 1];
+            ready_hist = [Duration::ZERO; READY_HIST_BUCKETS + 1];
             window_time = Duration::ZERO;
             floor_since = Instant::now();
         }
@@ -1190,61 +1289,122 @@ fn main() {
             );
         }
 
-        let n = cons.pop_slice(&mut in_buf);
-        if n == 0 {
-            continue;
-        }
-        if let Err(e) = rs.write_samples(&in_buf[..n]) {
-            eprintln!("ardftsrc-bridge: write_samples failed: {e:?}");
-            running.store(false, Ordering::SeqCst);
-            break;
-        }
-
-        // Drain everything the resampler has ready (Some(0) = unprimed or starved).
-        let mut wrote_any = false;
-        loop {
-            let w = match rs.read_samples(&mut out_f) {
-                Some(w) => w,
-                None => 0, // finalized — cannot happen in this loop
-            };
-            if w == 0 {
-                break;
-            }
-            // Complete a pending partial frame first, then write the whole-frame body.
-            let mut start = 0usize;
-            if !frame_carry.is_empty() {
-                let need = channels - frame_carry.len();
-                let take = need.min(w);
-                frame_carry.extend_from_slice(&out_f[..take]);
-                start = take;
-                if frame_carry.len() == channels {
-                    for (i, &x) in frame_carry.iter().enumerate() {
-                        out_i[i] = f64_to_i32(x);
-                    }
-                    if let Err(e) = write_all(&out_io, &out_pcm, &out_i[..channels], channels) {
-                        eprintln!("ardftsrc-bridge: output write failed: {e}");
-                        running.store(false, Ordering::SeqCst);
-                        break 'process;
-                    }
-                    wrote_any = true;
-                    frame_carry.clear();
+        // Ingest captured samples into the resampler, BOUNDED by the FIFO's remaining headroom.
+        // Anything that does not fit stays in the ring, where the trims above can reach it. See the
+        // loop header before touching this, and `ingest_high_water` for why the bound is not just
+        // the gate: a boolean gate with an unbounded pop overshoots the ceiling by a whole
+        // `pop_cap` (4096 input frames = 8192 output frames at 48k -> 96k), which is most of the
+        // reservoir the ceiling was chosen to prevent.
+        let ring_avail = cons.occupied_len();
+        let headroom_out = ingest_high_water.saturating_sub(ready_frames_now);
+        // Output-frame headroom -> input elements. Rounded DOWN, and to whole frames: a partial
+        // frame would rotate the channel mapping on the trim's drop path.
+        let mut take = (headroom_out as u64 * rate as u64 / TARGET_RATE as u64) as usize * channels;
+        take = take.min(pop_cap).min(ring_avail);
+        take -= take % channels;
+        if take > 0 {
+            let n = cons.pop_slice(&mut in_buf[..take]);
+            if n > 0 {
+                if let Err(e) = rs.write_samples(&in_buf[..n]) {
+                    eprintln!("ardftsrc-bridge: write_samples failed: {e:?}");
+                    running.store(false, Ordering::SeqCst);
+                    break 'process;
                 }
             }
-            let body = &out_f[start..w];
-            let whole = (body.len() / channels) * channels;
-            for i in 0..whole {
-                out_i[i] = f64_to_i32(body[i]);
+        }
+
+        // If resampler has no output frames ready, yield briefly and wait for more capture input.
+        let ready_samples = rs.num_samples_ready();
+        if ready_samples < channels {
+            thread::sleep(Duration::from_micros(500));
+            continue 'process;
+        }
+
+        // Query available playback buffer space in the output PCM.
+        let avail_frames = match out_pcm.avail_update() {
+            Ok(f) => f.max(0) as usize,
+            Err(e) => {
+                if out_pcm.try_recover(e, true).is_err() {
+                    eprintln!("ardftsrc-bridge: output PCM unrecoverable: {e}");
+                    running.store(false, Ordering::SeqCst);
+                    break 'process;
+                }
+                0
             }
-            if whole > 0 {
-                if let Err(e) = write_all(&out_io, &out_pcm, &out_i[..whole], channels) {
+        };
+
+        if avail_frames < min_out_write {
+            // ⚠ `PCM::wait` takes MILLISECONDS (alsa 0.9 `Option<u32>`), not a Duration.
+            // The timeout is a liveness backstop only — a stalled graph must not wedge the loop,
+            // because the trims above run at the top of it.
+            if let Err(e) = out_pcm.wait(Some(10)) {
+                let _ = out_pcm.try_recover(e, true);
+            }
+            continue 'process;
+        }
+
+        let ready_frames = ready_samples / channels;
+        let target_frames = out_chunk_frames(avail_frames, out_period_frames, ready_frames);
+        // Unreachable as the guards above stand (`avail_frames >= min_out_write >= 1` and
+        // `ready_frames >= 1`), and kept only so a future change to either guard degrades into a
+        // sleep rather than a zero-length `writei`. Every other path through this loop either
+        // writes, sleeps, or waits on the PCM — there is no busy spin.
+        if target_frames == 0 {
+            thread::sleep(Duration::from_micros(500));
+            continue 'process;
+        }
+
+        let target_samples = target_frames * channels;
+        let w = match rs.read_samples(&mut out_f[..target_samples]) {
+            Some(w) => w,
+            // None = finalized, which this loop never causes (`finalize` is never called). Treating
+            // it as "nothing to write" would spin this branch forever with no sleep and no wait.
+            None => {
+                eprintln!("ardftsrc-bridge: resampler finalized unexpectedly — stopping");
+                running.store(false, Ordering::SeqCst);
+                break 'process;
+            }
+        };
+        if w == 0 {
+            thread::sleep(Duration::from_micros(500));
+            continue 'process;
+        }
+
+        let mut wrote_any = false;
+        // Complete a pending partial frame first, then write the whole-frame body.
+        let mut start = 0usize;
+        if !frame_carry.is_empty() {
+            let need = channels - frame_carry.len();
+            let take = need.min(w);
+            frame_carry.extend_from_slice(&out_f[..take]);
+            start = take;
+            if frame_carry.len() == channels {
+                for (i, &x) in frame_carry.iter().enumerate() {
+                    out_i[i] = f64_to_i32(x);
+                }
+                if let Err(e) = write_all(&out_io, &out_pcm, &out_i[..channels], channels) {
                     eprintln!("ardftsrc-bridge: output write failed: {e}");
                     running.store(false, Ordering::SeqCst);
                     break 'process;
                 }
                 wrote_any = true;
+                frame_carry.clear();
             }
-            frame_carry.extend_from_slice(&body[whole..]);
         }
+        let body = &out_f[start..w];
+        let whole = (body.len() / channels) * channels;
+        for i in 0..whole {
+            out_i[i] = f64_to_i32(body[i]);
+        }
+        if whole > 0 {
+            if let Err(e) = write_all(&out_io, &out_pcm, &out_i[..whole], channels) {
+                eprintln!("ardftsrc-bridge: output write failed: {e}");
+                running.store(false, Ordering::SeqCst);
+                break 'process;
+            }
+            wrote_any = true;
+        }
+        frame_carry.extend_from_slice(&body[whole..]);
 
         if wrote_any && !first_write_done {
             first_write_done = true;
@@ -1399,5 +1559,48 @@ mod tests {
         assert_eq!(d.observe(Some(96_000)), None);
         assert_eq!(d.observe(Some(96_000)), None);
         assert_eq!(d.observe(Some(96_000)), Some(96_000));
+    }
+
+    /// The write must never exceed the space ALSA already reports, whichever of the three limits
+    /// is tightest. Exceeding `avail` is what makes `writei` block for a whole chunk, and that
+    /// block is the ring depth (ledger section 5b) — so this bound IS the fix, not a detail.
+    #[test]
+    fn out_chunk_never_exceeds_available_period_or_ready() {
+        let period = OUT_PERIOD as usize; // 1024
+        // A whole resampler chunk is ready and the buffer is empty: still one period.
+        assert_eq!(out_chunk_frames(2048, period, 3756), period);
+        // The resampler is the tightest bound.
+        assert_eq!(out_chunk_frames(2048, period, 512), 512);
+        // ALSA space is the tightest bound — the case that must never be rounded up.
+        assert_eq!(out_chunk_frames(512, period, 3756), 512);
+        // Nothing anywhere: the caller must not be handed a write to make.
+        assert_eq!(out_chunk_frames(0, period, 3756), 0);
+        assert_eq!(out_chunk_frames(2048, period, 0), 0);
+    }
+
+    /// The gate exists so an output stall leaves backlog in the RING, where the trims can drop it,
+    /// instead of in the resampler FIFO, which has no drop path. Two properties, and they pull
+    /// against each other: it must clear one whole emitted block (or it throttles steady state and
+    /// gives back the saving), and it must NOT clear the startup residue the one-shot trim exists
+    /// to drop (2-5 capture periods, per that trim's own comment).
+    #[test]
+    fn ingest_high_water_clears_one_block_but_not_the_startup_residue() {
+        let block_out_frames = 3756usize;      // one 48k -> 96k block
+        let high_water = block_out_frames + INGEST_SLACK;
+
+        assert!(high_water > block_out_frames, "must clear one whole emitted block");
+        assert!(high_water < block_out_frames * 2, "must not bank a second block of latency");
+
+        // Startup residue in OUTPUT frames: 2-5 capture periods at 48k -> 96k is 2x the input
+        // count, i.e. 1024-2560. Headroom above one block is exactly one output period (1024 f,
+        // 10.7 ms), so the FIFO absorbs the very smallest end of that range and the trim still
+        // reaches the rest. ⌀ That overlap is the accepted price of not throttling steady state —
+        // the gate is sized to the BLOCK, not to the residue. Stated so the next reader does not
+        // "discover" it as a bug and re-open the ceiling.
+        let residue_out_min = CAP_PERIOD as usize * 2 * 2;
+        let residue_out_max = CAP_PERIOD as usize * 5 * 2;
+        assert_eq!(high_water - block_out_frames, INGEST_SLACK);
+        assert!(high_water - block_out_frames <= residue_out_min);
+        assert!(high_water - block_out_frames < residue_out_max);
     }
 }
