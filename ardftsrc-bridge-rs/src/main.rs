@@ -710,10 +710,16 @@ fn main() {
     //    reducible term in the 145 ms bridge decomposition. RealtimeResampler accepts
     //    writes of any size and is drained as output becomes ready, so the ring holds only
     //    scheduling slack. ──
-    let config = PRESET_GOOD
-        .with_input_rate(rate as usize)
-        .with_output_rate(TARGET_RATE as usize)
-        .with_channels(channels);
+    // Built through a closure because the race reset below REBUILDS the resampler, and
+    // `RealtimeResampler::new` consumes the config. Rebuilding from the same expression
+    // avoids depending on the config type being Clone.
+    let make_config = || {
+        PRESET_GOOD
+            .with_input_rate(rate as usize)
+            .with_output_rate(TARGET_RATE as usize)
+            .with_channels(channels)
+    };
+    let config = make_config();
     eprintln!(
         "ardftsrc-bridge: {} ({}) {}Hz S32 x{}ch -> {}Hz x{}ch (PRESET_GOOD: quality={}, bw={:.3}) in={}",
         cfg.name, cfg.card, rate, channels, TARGET_RATE, channels, config.quality, config.bandwidth, cfg.in_device
@@ -991,7 +997,30 @@ fn main() {
     let ingest_high_water = block_out_frames + INGEST_SLACK;
     let t_start = Instant::now();
     let mut first_write_done = false;
-    let mut startup_trimmed = false;
+    // ── RACE RESET ──────────────────────────────────────────────────────────────────
+    // Everything the bridge accumulates between capture starting and the graph actually
+    // pulling is CONSERVED: input and output both run at real time, so whatever depth the
+    // race leaves behind is permanent latency for the life of the instance (ledger §5b).
+    // That is what redraws the latency at every start.
+    //
+    // ⛔ It cannot be trimmed out of the ring. Measured 2026-08-21 across four starts: at
+    // the moment the old start-up trim fired, `ring=0f(0.0ms)` while `ready=4610f(48.0ms)`
+    // — the audio had already been pushed through into the resampler's FIFO, which is an
+    // unbounded `VecDeque` inside the crate with no shed API. A ring trim watches a
+    // compartment the backlog has left. That is §5b's "there is no excess to trim", which
+    // is a statement about REACHABILITY, not size.
+    //
+    // ⛔ It cannot be drained downstream either. Conserved upstream backlog does not
+    // produce a downstream queue — it is a phase offset, not stored data. The NDI
+    // transmitter's `drain_capture_backlog()` reports `availp10/50/90=0/0/0f` precisely
+    // because there is nothing there to find.
+    //
+    // ⇒ The only thing conservation cannot defeat is ZEROING EVERY REACHABLE COMPARTMENT
+    // AT ONE INSTANT, once the far end is provably awake. Clearing is shedding, not
+    // moving, so unlike every buffer-size knob tried before it the audio does not
+    // reappear one stage over. `out` is deliberately NOT cleared — see the reset block.
+    let mut out_frames_written: i64 = 0;
+    let mut race_reset_done = false;
     let mut over_since: Option<Instant> = None;
     // Ring FLOOR over a window — the statistic that separates slack from backlog. See
     // the trim block below for why the PEAK cannot.
@@ -1069,24 +1098,26 @@ fn main() {
         // ── Backlog trims. In-flight audio is CONSERVED in this pipeline (input and
         //    output both run at real-time rate), so backlog accumulated during ANY output
         //    stall is PERMANENT latency once flow resumes. Each trim costs one brief
-        //    audible skip instead of a constant extra delay. Two mechanisms:
-        //    (1) startup one-shot: ~2 s after the first write, drop the residue that
-        //        accumulated while the output node waited for its PipeWire graph link
-        //        (measured: 2-5 capture periods — too close to normal slack for a
-        //        threshold to separate);
-        //    (2) sustained stall guard at 8x keep: catches big stalls — a pipewire/stack
+        //    audible skip instead of a constant extra delay.
+        //
+        //    Everything from here down handles STALLS DURING STEADY RUNNING. The START-UP
+        //    transient is not handled here at all — see the race reset at the bottom of the
+        //    loop. A start-up one-shot used to live in this chain and was removed
+        //    2026-08-21: it read `avail` (the ring), and the ring is measurably EMPTY at
+        //    start-up while the backlog sits in the resampler's FIFO, so it could only ever
+        //    trim zero. Do not re-add a ring-based start-up trim.
+        //
+        //    (1) sustained stall guard at 8x keep: catches big stalls — a pipewire/stack
         //        restart pinned the ring at ~557 ms live 2026-06-10. Normal post-trim
         //        slack re-locks at 2-4 periods (resampler chunk quantization), so 8x
-        //        with the sustained-1s filter never trips in steady state. ──
+        //        with the sustained-1s filter never trips in steady state;
+        //    (2) the dead-band trim further down, for backlog that never drains. ──
         let keep = keep_elems;
         let mut trim_to_keep = false;
-        let mut trim_tag = "startup";
+        let mut trim_tag = "stall";
         // The window's floor, captured for the p10 trim's ACTION (see the trim block).
         let mut trim_floor = 0usize;
-        if !startup_trimmed && first_write_done && t_start.elapsed() >= Duration::from_secs(2) {
-            startup_trimmed = true;
-            trim_to_keep = avail > keep;
-        } else if first_write_done && avail > keep * 8 {
+        if first_write_done && avail > keep * 8 {
             match over_since {
                 None => over_since = Some(Instant::now()),
                 Some(t) if t.elapsed() >= Duration::from_secs(1) => {
@@ -1388,6 +1419,7 @@ fn main() {
                     break 'process;
                 }
                 wrote_any = true;
+                out_frames_written += 1;
                 frame_carry.clear();
             }
         }
@@ -1403,6 +1435,7 @@ fn main() {
                 break 'process;
             }
             wrote_any = true;
+            out_frames_written += (whole / channels) as i64;
         }
         frame_carry.extend_from_slice(&body[whole..]);
 
@@ -1431,6 +1464,72 @@ fn main() {
                 out_pcm.delay().unwrap_or(-1),
                 floor_min,
                 if window_time.is_zero() { 1.0 } else { depth_hist[0].as_secs_f64() / window_time.as_secs_f64() },
+            );
+        }
+
+        // ── THE RACE RESET. See the declaration of `race_reset_done` for why this is a
+        //    simultaneous clear rather than a trim of any single compartment. ──
+        //
+        // TRIGGER: the consumer must be PROVEN to be draining, not assumed. Frames merely
+        // handed to the output PCM are still sitting in its buffer, so `out_frames_written`
+        // only means something once it exceeds what that buffer holds by itself. Same shape
+        // as `pcm_backlog_trim.py`'s `written > 2 * pipe_capacity` test, and for the same
+        // reason: before that point a "successful write" proves nothing about the far end.
+        if !race_reset_done && first_write_done && out_frames_written > 2 * OUT_BUFFER {
+            race_reset_done = true;
+            let pre_ring = cons.occupied_len();
+            let pre_ready = rs.num_samples_ready();
+
+            // 1. ring -> 0.
+            loop {
+                let got = cons.pop_slice(&mut in_buf[..pop_cap]);
+                if got == 0 {
+                    break;
+                }
+            }
+            // 2. resampler FIFO + its half-accumulated chunk -> 0. There is no shed API on
+            //    `samples_pending_output`, so the whole resampler is rebuilt. This discards
+            //    its priming, which costs one chunk (~39 ms @48k) of audio at the reset —
+            //    on a path that is already discontinuous at start-up.
+            rs = match RealtimeResampler::<f64>::new(make_config()) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("ardftsrc-bridge: resampler rebuild at race reset failed: {e:?}");
+                    running.store(false, Ordering::SeqCst);
+                    break 'process;
+                }
+            };
+            // 3. any partial frame straddling the reset would rotate the channel mapping.
+            frame_carry.clear();
+            // ⛔ `out` is deliberately NOT cleared. It is bounded by OUT_BUFFER and the
+            //    blocking write keeps it near full BY DESIGN — that is the working buffer
+            //    feeding the consumer, not race residue, and dropping it would underrun
+            //    immediately. It is also the `pipewire` ALSA plugin, i.e. this bridge's
+            //    graph node: `snd_pcm_drop`/`prepare` there risks tearing the node down and
+            //    making `source_router` re-link, which is the very race being closed.
+
+            // Post-reset the window statistics describe a pipeline that no longer exists,
+            // and the dead-band trim must not act on them. Restart every accumulator.
+            floor_min = usize::MAX;
+            floor_since = Instant::now();
+            depth_hist = [Duration::ZERO; DEPTH_BUCKETS + 1];
+            ring_hist = [Duration::ZERO; RING_HIST_BUCKETS + 1];
+            ready_hist = [Duration::ZERO; READY_HIST_BUCKETS + 1];
+            window_time = Duration::ZERO;
+            last_poll = Instant::now();
+            floor_armed = true;
+            floor_strikes = 0;
+            trim_bursts = 0;
+
+            eprintln!(
+                "ardftsrc-bridge[diag race-reset]: consumer proven draining at {}f written; \
+                 shed ring={}f({:.1}ms) ready={}f({:.1}ms) out=KEPT {}f",
+                out_frames_written,
+                pre_ring / channels,
+                (pre_ring / channels) as f64 * 1000.0 / rate as f64,
+                pre_ready / channels,
+                (pre_ready / channels) as f64 * 1000.0 / TARGET_RATE as f64,
+                out_pcm.delay().unwrap_or(-1),
             );
         }
     }
