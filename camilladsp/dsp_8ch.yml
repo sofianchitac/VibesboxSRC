@@ -33,7 +33,7 @@ devices:
     node_name: dsp-out
     node_description: "Vibesbox DSP output (8ch)"
     node_group_name: vibesbox-dsp   # same group as capture
-    autoconnect_to: null            # daemon links dsp-out -> sink.ndi-feed
+    autoconnect_to: null            # daemon links dsp-out -> ndi-tx-in
   queuelimit: null
   rate_measure_interval: null
   resampler:

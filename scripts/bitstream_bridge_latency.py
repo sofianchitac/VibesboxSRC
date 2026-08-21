@@ -20,10 +20,10 @@ What it measures vs assumes:
                                              per-codec bitrate (compressed ES), so the
                                              ms is approximate but the magnitude is not
   MEASURED   ffmpeg -> pw-cat pipe fill      FIONREAD, exact bytes->ms (f32 6ch 48k)
-  MEASURED   NDITX capture buffer            /proc/asound/<NDITX>/pcm1c/sub0/status
+  MEASURED   transmitter reader backlog      ndi-output's own [tx window] log line
   ASSUMED    ffmpeg decode frame             one frame: 1536 spl (DD+/AC-3), 512 (DTS)
   ASSUMED    pw-cat --latency                1536 frames @48k, from the unit's cmdline
-  ASSUMED    PipeWire graph to sink.ndi-feed 3 x 512/96k
+  ASSUMED    PipeWire graph to ndi-tx-in     3 x 512/96k
 
 The ASSUMED terms are structural constants, not guesses, but they are labelled so a
 total can never be quoted as fully measured.
@@ -197,13 +197,12 @@ def sample(codec, stage):
     else:
         unknown.append("pw-cat --latency (not on the cmdline)")
 
-    rows.append(("PipeWire graph -> sink.ndi-feed", GRAPH_QUANTA_MS, "ASSUMED"))
+    rows.append(("PipeWire graph -> ndi-tx-in", GRAPH_QUANTA_MS, "ASSUMED"))
 
-    d, rate = alsa_delay("/proc/asound/NDITX", "pcm1c/sub0")
-    if d is not None:
-        rows.append(("NDITX -> ndi_transmitter", d / rate * 1000, "MEASURED"))
-    else:
-        unknown.append("NDITX capture (ndi-output not RUNNING)")
+    # ⌀ The NDITX loopback row was dropped 2026-08-21 with the loopback itself. The
+    # transmitter now reads PipeWire directly and reports its own backlog every 5 s as
+    # `[tx window] availp10/50/90=…` in `journalctl -u ndi-output` — measured 0 frames
+    # in steady state, which is why there is no row here to add it back.
 
     return rows, unknown
 

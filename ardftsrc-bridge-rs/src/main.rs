@@ -444,7 +444,7 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
         // tap limit: CamillaDSP's dsp_6ch.yml is capture 6 / playback 6, ndi_transmitter.py
         // sends 6ch, and the NDI stream is literally named VibesboxSRC-5.1. So a 7.1 source
         // loses the pair on lane SD3. Raising this to 8 means changing the CamillaDSP
-        // config, the NDITX loopback width, the transmitter, the stream identity and
+        // config, the transmitter's read width, the stream identity and
         // REAPER's input — a system-wide change, NOT a one-line edit here.
         //
         // Always 6ch, with no stereo/multichannel detection: when the TV sends 2.0 the

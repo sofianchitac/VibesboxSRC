@@ -3,7 +3,7 @@
 # Session manager for the system-mode PipeWire above. Runs as the same `pipewire` user and
 # shares XDG_RUNTIME_DIR=/run/pipewire (the dir is owned/created by pipewire.service via
 # RuntimeDirectory=). Applies the Vibesbox monitor.alsa rules in
-# /etc/wireplumber/wireplumber.conf.d/51-*.conf + 52-*.conf (sink.ndi-feed, source.usb).
+# /etc/wireplumber/wireplumber.conf.d/52-*.conf + 53-*.conf (source.usb, bluez).
 #
 # BindsTo=pipewire.service: if PipeWire stops/restarts, WirePlumber follows (a session
 # manager against a dead daemon is useless).

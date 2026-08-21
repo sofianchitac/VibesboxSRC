@@ -494,7 +494,7 @@ fi
 mkdir -p /etc/pipewire/pipewire.conf.d
 cp "$INSTALL_DIR"/config/pipewire/pipewire.conf.d/*.conf /etc/pipewire/pipewire.conf.d/
 
-# Vibesbox node rules (sink.ndi-feed, source.usb) → WirePlumber
+# Vibesbox node rules (source.usb, bluez) → WirePlumber
 mkdir -p /etc/wireplumber/wireplumber.conf.d
 cp "$INSTALL_DIR"/config/wireplumber/wireplumber.conf.d/*.conf /etc/wireplumber/wireplumber.conf.d/
 

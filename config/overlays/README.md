@@ -184,7 +184,7 @@ limit is entirely **downstream**, in three places at once:
 | Stage | Width |
 |---|---|
 | `camilladsp/dsp_6ch.yml` | capture 6 / playback 6 |
-| `NDITX` loopback + `ndi_transmitter.py` | 6ch |
+| `ndi_transmitter.py` (reads PipeWire directly) | 8ch |
 | NDI stream identity | `VibesboxSRC-5.1` |
 
 So a 7.1 source loses the pair on lane SD3, and that is a choice, not a hardware

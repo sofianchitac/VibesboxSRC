@@ -166,7 +166,7 @@ step_ok "systemd daemon-reload"
 
 # ── 4. Restart ──────────────────────────────────────────────────────────────
 # Order matters and mirrors the boot order: PipeWire/WirePlumber own the node
-# definitions (sink.ndi-feed's channel count and position) and must settle before
+# definitions (source node names and channel maps) and must settle before
 # CamillaDSP opens them; source_router pushes the CamillaDSP config on connect, so
 # it follows CamillaDSP; the transmitter drains the loopback CamillaDSP feeds.
 # Restarting out of order leaves the graph built from the OLD node definitions.

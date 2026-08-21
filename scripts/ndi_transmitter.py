@@ -2,20 +2,26 @@
 """
 NDI Audio Transmitter — NDI SDK 6.x via ctypes
 ================================================
-Reads 8ch FLOAT32LE / 96kHz audio from the NDITX ALSA snd-aloop read side
-(hw:NDITX,1,0) and transmits it as a named NDI audio source on the network.
+Reads 8ch FLOAT32LE / 96kHz audio from the capture device named by NDI_ALSA_DEV —
+CamillaDSP's output, taken straight out of PipeWire through the ALSA `pipewire` plugin —
+and transmits it as a named NDI audio source on the network.
+
+★ 2026-08-21: this used to read `hw:NDITX,1,0`, an snd-aloop loopback that CamillaDSP
+wrote into. Going direct measured **18.5-20.0 ms** cheaper end to end (four interleaved
+block pairs at two rates, docs/ndi-loopback-hop-brief.md) — more than the 9.3 ms the
+loopback itself held, because the sink's own ALSA output buffer went with it. Everything
+below is device-agnostic: only NDI_ALSA_DEV changed.
 
 Key design decisions vs. ndi-free-audio binary:
-  - Reads NDITX by name ("hw:NDITX,1,0"), never by fragile PortAudio device index.
+  - Reads the device named in the unit, never by fragile PortAudio device index.
   - Enforces exact ALSA params: 8ch / 96kHz / FLOAT32LE — will not silently
     negotiate a wrong format.
-  - snd-aloop constrains device 1 to the same params as device 0 once CamillaDSP
-    opens the write side; this script will retry until that happens.
+  - The capture retries until PipeWire is up and the graph accepts the params.
   - NDI audio frame: FLTP (planar float32), 8ch, 96kHz — all correct.
   - Interleaved→planar conversion via numpy (zero-copy transpose).
   - No PortAudio, no binary EULA, no guessing.
 
-Reads from  : hw:NDITX,1,0  (snd-aloop read side — CamillaDSP writes to ,0,0)
+Reads from  : NDI_ALSA_DEV (pipewire:… — source_router links dsp-out into it)
 Transmits as: NDI source, name from NDI_TX_NAME env var (default VibesboxSRC-5.1)
 
 Pure 8ch passthrough: ALSA reads the 8ch sum bus and we transmit it verbatim.
@@ -54,9 +60,9 @@ logging.basicConfig(
 
 # ── Configuration (environment overrides) ─────────────────────────────────────
 NDI_LIB_PATH   = os.environ.get("NDI_LIB_PATH",   "/usr/local/lib/libndi.so")
-ALSA_DEVICE    = os.environ.get("NDI_ALSA_DEV",   "hw:NDITX,1,0")
+ALSA_DEVICE    = os.environ.get("NDI_ALSA_DEV",   "pipewire:NODE=,PERIOD_BYTES=16384,BUFFER_BYTES=32768")
 SAMPLE_RATE    = int(os.environ.get("NDI_RATE",    "96000"))
-ALSA_CHANNELS  = int(os.environ.get("NDI_ALSA_CH", "8"))   # ALSA read width (NDITX is 8ch)
+ALSA_CHANNELS  = int(os.environ.get("NDI_ALSA_CH", "8"))   # ALSA read width (the sum bus is 8ch)
 NDI_CHANNELS   = ALSA_CHANNELS                              # NDI send width = read width (pure passthrough)
 PERIOD_FRAMES  = int(os.environ.get("NDI_PERIOD",  "1024"))   # match CamillaDSP chunksize
 # Start-up backlog drain — see drain_capture_backlog(). A period out of backlog
@@ -64,6 +70,10 @@ PERIOD_FRAMES  = int(os.environ.get("NDI_PERIOD",  "1024"))   # match CamillaDSP
 # this fraction of a period is therefore backlog, not live audio.
 DRAIN_LIVE_FRACTION = float(os.environ.get("NDI_DRAIN_FRACTION", "0.5"))
 DRAIN_MAX_S         = float(os.environ.get("NDI_DRAIN_MAX_S",   "3.0"))
+# Passive occupancy telemetry — see the [tx window] block in the capture loop. Seconds per
+# summary line; 0 disables. Costs one avail() ioctl per period (~188/s) and one log line
+# per window, so it is cheap enough to leave on in production.
+TELEMETRY_S    = float(os.environ.get("NDI_TELEMETRY_S", "5.0"))
 NDI_NAME       = os.environ.get("NDI_TX_NAME",    "VibesboxSRC-5.1")
 
 ALSA_OPEN_RETRIES    = 30     # attempts before giving up
@@ -142,11 +152,11 @@ def load_ndi_library(path: str) -> ctypes.CDLL:
 
 def open_alsa_capture() -> alsaaudio.PCM:
     """
-    Open the NDITX snd-aloop read side with exact params.
+    Open the capture device with exact params.
 
-    snd-aloop locks device 1 to the same format as device 0 once CamillaDSP
-    opens the write side. We retry until CamillaDSP has applied its 8ch config
-    and the loopback accepts FLOAT32LE / 8ch / 96kHz.
+    The `pipewire` plugin grants exactly what is asked (measured 2026-08-21: 512/1024
+    frames for PERIOD_BYTES=16384/BUFFER_BYTES=32768), but the daemon has to be up and
+    the graph has to accept FLOAT32LE / 8ch / 96kHz, so we retry until it does.
 
     Raises RuntimeError if the device never becomes available.
     """
@@ -183,12 +193,17 @@ def open_alsa_capture() -> alsaaudio.PCM:
 
 
 def drain_capture_backlog(pcm: alsaaudio.PCM) -> None:
-    """Discard whatever is already sitting in the loopback before going live.
+    """Discard whatever is already sitting in the capture buffer before going live.
 
-    CamillaDSP writes into the NDITX snd-aloop continuously. Whenever this reader is
-    away — a restart, or any stall long enough to gap the read — the buffer fills with
-    nobody draining it, and on reopen that backlog sits IN FRONT OF every subsequent
-    sample for the life of the process. Measured 10-43 ms discarded per open.
+    ✅ Written for snd-aloop, verified against the `pipewire` plugin on 2026-08-21: it
+    discards one period and then blocks, which is the shape the premise predicts. Watch
+    the "drain:" line — "hit the … cap still reading faster than real time" would mean
+    the premise stopped holding.
+
+    Whenever this reader is away — a restart, or any stall long enough to gap the read —
+    whatever is queued ahead of it sits IN FRONT OF every subsequent sample for the life
+    of the process. On the retired snd-aloop path that was 10-43 ms per open; on the
+    PipeWire path it is one period.
 
     ⛔ WHAT THIS IS *NOT*. It does NOT fix the latency ratchet in
     docs/latency-matrix-plan.md §17-18, and it was written believing that it would.
@@ -211,9 +226,8 @@ def drain_capture_backlog(pcm: alsaaudio.PCM) -> None:
     (An avail()-based version would be tidier but is not portable across pyalsaaudio
     versions, and this runs once per open.)
     """
-    # ⚠ The period is whatever snd-aloop locked to CamillaDSP's chunksize, NOT
-    # PERIOD_FRAMES — measured 512, while PERIOD_FRAMES defaults to 1024. Using the
-    # requested size would double the threshold and call live audio "backlog".
+    # ⚠ Use the GRANTED period, not PERIOD_FRAMES: the two can differ, and using the
+    # requested size would move the threshold and call live audio "backlog".
     # Defensive: this runs inside the production transmitter, and an exception here
     # would take NDI output down entirely. A wrong-but-sane threshold is survivable;
     # a crash is not. (pyalsaaudio 0.11.0 on the Pi does provide period_size.)
@@ -267,9 +281,9 @@ def drain_capture_backlog(pcm: alsaaudio.PCM) -> None:
 
     if frames:
         logging.info(f"drain: discarded {frames} frames ({frames / SAMPLE_RATE * 1000:.1f} ms, "
-                     f"{periods} periods) of stale loopback backlog before going live.")
+                     f"{periods} periods) of stale backlog before going live.")
     else:
-        logging.info("drain: loopback was already at the live edge, nothing to discard.")
+        logging.info("drain: capture was already at the live edge, nothing to discard.")
 
 
 # ── Main transmitter loop ──────────────────────────────────────────────────────
@@ -329,6 +343,9 @@ def run():
     # ── Capture → transmit loop ───────────────────────────────────────────────
     logging.info("NDI transmitter running.")
     consecutive_errors = 0
+    avail_samples = []          # [tx window] telemetry, see the capture loop
+    frames_sent   = 0
+    tele_t0       = time.monotonic()
 
     while True:
         try:
@@ -382,6 +399,41 @@ def run():
 
         frame.p_data = planar.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         ndi.NDIlib_send_send_audio_v3(sender, ctypes.byref(frame))
+
+        # ── [tx window] passive occupancy telemetry ───────────────────────────────
+        # The chain has NO read-out between dsp-in and the NDI send, and that is exactly
+        # the span the 105-125 ms run-to-run variance lives in (2026-08-21: the bridge's
+        # own ring/ready/out stayed flat across a 14.5 ms swing). avail() straight after a
+        # read is this reader's residual backlog — the same quantity /proc/asound gave for
+        # the aloop arm (9.3 ms p50, 2026-08-20) and the ONLY way to see it on the
+        # PipeWire arm, which has no /proc entry at all.
+        #
+        # ⚠ Reported as a DISTRIBUTION, never a point sample: this is a sawtooth, and a
+        # point sample of a sawtooth is what made `ring=` on the bridge's 5 s line
+        # useless (ledger §6.1). Frames sent per window is included so a window that
+        # stalled cannot be mistaken for a window that ran clean.
+        if TELEMETRY_S > 0:
+            try:
+                avail_samples.append(pcm.avail())
+            except Exception:
+                pass                       # never let telemetry kill the transmitter
+            frames_sent += length
+            now = time.monotonic()
+            if now - tele_t0 >= TELEMETRY_S and avail_samples:
+                s = sorted(avail_samples)
+                def _q(p):                 # nearest-rank percentile, no numpy dependency
+                    return s[min(len(s) - 1, int(len(s) * p))]
+                ms = 1000.0 / SAMPLE_RATE
+                logging.info(
+                    f"[tx window] availp10/50/90={_q(0.1)}/{_q(0.5)}/{_q(0.9)}f"
+                    f"({_q(0.1)*ms:.1f}/{_q(0.5)*ms:.1f}/{_q(0.9)*ms:.1f}ms) "
+                    f"max={s[-1]}f({s[-1]*ms:.1f}ms) n={len(s)} "
+                    f"sent={frames_sent}f({frames_sent*ms/1000.0:.2f}s) "
+                    f"wall={now - tele_t0:.2f}s"
+                )
+                avail_samples.clear()
+                frames_sent = 0
+                tele_t0 = now
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

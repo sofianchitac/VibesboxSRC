@@ -4,16 +4,17 @@ Source Router Daemon — VibesboxSRC v2 (PipeWire backbone)
 
 Replaces auto_router.py. PipeWire is the audio graph, hard-pinned to 96 kHz. Every
 unmuted, playing source is summed (by PipeWire, in F32) into CamillaDSP's NATIVE PipeWire
-capture node "dsp-in"; CamillaDSP's playback node "dsp-out" is linked to sink.ndi-feed
-(6ch NDI — the only output transport since the Pi 5 migration dropped the HiFiBerry;
-the v2-era S/PDIF transport selector is retired, see git history for the dual-sink era).
+capture node "dsp-in"; CamillaDSP's playback node "dsp-out" is linked straight into the NDI
+transmitter's own capture node "ndi-tx-in" (8ch NDI — the only output transport since the Pi 5
+migration dropped the HiFiBerry; the v2-era S/PDIF selector and, since 2026-08-21, the
+sink.ndi-feed/snd-aloop hop it fed are both retired — see git history).
 
 This daemon's whole job is routing + state, not pipeline reconfiguration:
   * discover source nodes in the graph (poll `pw-dump`, ~2 Hz — NOT pw-mon streaming,
     which the house style distrusts; cf. auto_router.py's bluetoothctl-monitor note)
   * link each playing + unmuted source into dsp-in (FL/FR for stereo, all 6 for USB),
     unlink muted or stopped ones — mute IS link/unlink
-  * on startup: push dsp_6ch to CamillaDSP and link dsp-out -> sink.ndi-feed;
+  * on startup: push dsp_8ch to CamillaDSP and link dsp-out -> ndi-tx-in;
     start ndi-output
   * run the manual Bluetooth pairing state machine (pairing is the only manual step;
     once connected, BT mixes in like any source)
@@ -41,9 +42,9 @@ WebSocket state frame (server -> client), schema changed from v1:
 
 PENDING BENCH VALIDATION (P4): the PipeWire node/port names below come from the P2/P3
 bench findings; confirm against `pw-dump` on the box (esp. source node names, dsp-in/dsp-out
-created by the native backend, sink.ndi-feed from the WirePlumber rules). The
+created by the native backend, ndi-tx-in from the transmitter's PIPEWIRE_ALSA props). The
 daemon discovers ports dynamically by audio.channel, so port-name surprises are tolerated;
-node-name surprises are a one-line edit to SOURCES / the sink constants.
+node-name surprises are a one-line edit to SOURCES / NDI_TX_NODE.
 """
 
 import os
@@ -79,8 +80,13 @@ OUTPUT_RATE = 96000
 DSP_IN_NODE  = "dsp-in"    # CDSP capture  — sources link their outputs into its inputs
 DSP_OUT_NODE = "dsp-out"   # CDSP playback — its outputs link into the active sink's inputs
 
-# Output sink (WirePlumber-named, config/wireplumber/wireplumber.conf.d/51-vibesbox-sinks.conf).
-SINK_NDI = "sink.ndi-feed"   # 6ch NDI feed (NDITX snd-aloop wrap) — the only output transport
+# THE output node: the NDI transmitter's own PipeWire capture stream, named by PIPEWIRE_ALSA
+# in services/ndi-output.service. dsp-out links straight into it — measured 2026-08-21 as
+# 18.5-20.0 ms cheaper than the sink.ndi-feed -> snd-aloop -> ALSA path it replaced (four
+# interleaved block pairs, two rates; docs/ndi-loopback-hop-brief.md).
+# ⚠ This is a CLIENT STREAM, not a device sink: it appears and disappears with the ndi-output
+# process, and reconcile() (2 Hz) is what links it each time.
+NDI_TX_NODE = "ndi-tx-in"
 
 CH6 = ["FL", "FR", "FC", "LFE", "RL", "RR"]
 CH2 = ["FL", "FR"]
@@ -273,6 +279,10 @@ class SourceRouter:
         # wpctl call runs once, not every 2 Hz reconcile.
         self._vol_pinned = set()
 
+        # ndi-tx-in comes and goes with the ndi-output process; log the transition once
+        # rather than every 2 Hz reconcile, so a transmitter that never came back is visible.
+        self._tx_node_present = None
+
     # ====================================================================== #
     #  Persistence                                                            #
     # ====================================================================== #
@@ -418,17 +428,28 @@ class SourceRouter:
         except Exception as exc:
             logging.warning(f"pw-link -d {out_pid}->{in_pid} failed: {exc}")
 
-    def _pin_sink_volumes(self, names: dict):
-        """Force the output sink to unity once it appears (see _vol_pinned rationale)."""
-        for sink in (SINK_NDI,):
-            if sink in self._vol_pinned:
-                continue
+    def _pin_output_volume(self, names: dict):
+        """Force the output node to unity once it appears (see _vol_pinned rationale)."""
+        for sink in (NDI_TX_NODE,):
             nid = names.get(sink)
             if nid is None:
+                # NDI_TX_NODE is a client stream and goes away with the ndi-output
+                # process; forget the pin so its next instance is pinned again. A sink
+                # is restored once, a stream on every appearance.
+                self._vol_pinned.discard(sink)
+                continue
+            if sink in self._vol_pinned:
                 continue
             try:
-                subprocess.run(["wpctl", "set-volume", str(nid), "1.0"],
-                               capture_output=True, timeout=PW_TIMEOUT)
+                # Check the exit status: a node with no volume Props (possible for a
+                # client stream) makes wpctl fail, and marking it pinned anyway would
+                # silently hide exactly the restored-volume case this exists to catch.
+                r = subprocess.run(["wpctl", "set-volume", str(nid), "1.0"],
+                                   capture_output=True, timeout=PW_TIMEOUT)
+                if r.returncode != 0:
+                    logging.warning(f"wpctl set-volume {sink} returned {r.returncode}: "
+                                    f"{r.stderr.decode(errors='replace').strip()}")
+                    continue
                 self._vol_pinned.add(sink)
                 logging.info(f"{sink}: volume pinned to 1.0.")
             except Exception as exc:
@@ -890,7 +911,7 @@ class SourceRouter:
                 return
             names, state, out_ports, in_ports, port_node, links = self._index(dump)
 
-            self._pin_sink_volumes(names)
+            self._pin_output_volume(names)
 
             dsp_in_id  = names.get(DSP_IN_NODE)
             dsp_out_id = names.get(DSP_OUT_NODE)
@@ -898,20 +919,39 @@ class SourceRouter:
             desired = set()                 # (out_port_id, in_port_id)
             managed_out_nodes = set()       # node ids whose output links we own
 
-            # ── dsp-out -> sink.ndi-feed (the only output transport) ─────────
-            # CamillaDSP always runs the 6ch passthrough; all 6 dsp-out channels
-            # link into the NDI feed sink. The v2-era NDI/S-PDIF transport
-            # selector is retired (no S/PDIF hardware on the Pi 5).
+            # ── dsp-out -> ndi-tx-in (the only output transport) ─────────────
+            # CamillaDSP always runs the 8ch passthrough; all 8 dsp-out channels
+            # link into the transmitter's capture node. The v2-era NDI/S-PDIF
+            # selector and the sink.ndi-feed hop are both retired.
             if dsp_out_id is not None:
                 managed_out_nodes.add(dsp_out_id)
                 src_p = out_ports.get(dsp_out_id, {})
-                ndi_id = names.get(SINK_NDI)
-                if ndi_id is not None:
-                    dst_p = in_ports.get(ndi_id, {})
-                    # CH8, not CH6 — dsp-out and sink.ndi-feed are both 8 wide now, and
-                    # a CH6 loop silently left lanes 7-8 unlinked (i.e. the surrounds we
-                    # widened the chain to keep). Safe at either width: the membership
+                # ⚠ Retired 2026-08-21: dsp-out used to feed sink.ndi-feed, an snd-aloop
+                # wrapper the transmitter then read back through ALSA. Measured at 18.5-20.0 ms
+                # for the round trip through the sink's own output buffer and the loopback, so
+                # the sink, its WirePlumber rules and the NDITX card are all gone. With no
+                # device node left in this group the graph is driven by PipeWire's timer-based
+                # Dummy-Driver; the rate domain is unchanged (ledger §4: the aloop clock WAS
+                # system time, +0.02 ppm).
+                consumer = NDI_TX_NODE
+                if (consumer in names) != self._tx_node_present:
+                    self._tx_node_present = consumer in names
+                    logging.info(f"{consumer}: "
+                                 + ("present — linking dsp-out into it."
+                                    if self._tx_node_present else
+                                    "GONE — no output transport until ndi-output is back."))
+                cid = names.get(consumer)
+                if cid is not None:
+                    dst_p = in_ports.get(cid, {})
+                    # CH8, not CH6 — dsp-out and the transmitter are both 8 wide, and a
+                    # CH6 loop silently left lanes 7-8 unlinked (i.e. the surrounds the
+                    # chain was widened to keep). Safe at either width: the membership
                     # test below only links ports that actually exist on both nodes.
+                    # Linking by NAME is linking by INDEX here: measured 2026-08-21, the
+                    # ALSA `pipewire` plugin's 8ch capture stream exposes exactly
+                    # FL FR FC LFE RL RR SL SR, the same list and the same order as the
+                    # sink — so neither consumer reorders a lane. ⛔ If that ever stops
+                    # being true the fix is positional linking, never a remap.
                     for ch in CH8:
                         if ch in src_p and ch in dst_p:
                             desired.add((src_p[ch], dst_p[ch]))
@@ -1261,7 +1301,7 @@ class SourceRouter:
         # Pi-side DSP + PipeWire graph latency in ms, derived from the pinned 96k config:
         # CamillaDSP holds ~target_level frames of playback buffer, plus one PipeWire quantum
         # (== chunksize) on each of the two graph domains (source->dsp-in, dsp-out->sink).
-        # Excludes the ardftsrc bridge ALSA capture buffer and the NDITX loopback buffer
+        # Excludes the ardftsrc bridge ALSA capture buffer and the transmitter's own reader
         # (those are outside PipeWire's view and need a loopback measurement, not introspection).
         tl = self.cdsp_state.get("target_level")
         cs = self.cdsp_state.get("chunksize")
@@ -1394,7 +1434,7 @@ class SourceRouter:
         )
 
         # Bring CamillaDSP up to its static config so the dsp-in/dsp-out PipeWire nodes
-        # exist; reconcile() then links dsp-out -> sink.ndi-feed and sources -> dsp-in.
+        # exist; reconcile() then links dsp-out -> ndi-tx-in and sources -> dsp-in.
         if await self._wait_for_cdsp():
             self._push_config()
             self._cdsp_was_connected = True

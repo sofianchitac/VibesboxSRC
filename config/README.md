@@ -12,7 +12,7 @@ PipeWire's adaptive resampler stays in the path deliberately, to absorb drift be
 source clocks and the graph clock.
 
 **`wireplumber/`** names things and decides what is allowed to touch what. It gives the
-sum-bus sink and the source nodes stable names (`sink.ndi-feed`, `source.usb`, …) so
+source nodes stable names (`source.usb`, …) so
 `source_router.py` can link by name rather than by index, assigns clock authority, and —
 just as importantly — *suppresses* nodes WirePlumber would otherwise create. The eARC
 capture card is the clearest case: WirePlumber cannot read a channel map off an I2S slave
