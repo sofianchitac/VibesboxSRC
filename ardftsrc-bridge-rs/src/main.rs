@@ -382,10 +382,12 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
             // NOTE: iPadOS/macOS ignore the UAC2 channel mask and emit 5.1 in a FIXED
             // physical order regardless of file tag/codec — a standard SMPTE file
             // (L R C LFE Ls Rs) arrives as L R Ls Rs C LFE (center & LFE last). Proven
-            // 2026-06-17 with the channel-ID test files. Do NOT try to correct it here:
-            // PipeWire audio.position is cosmetic to the NDI wire (which is index-ordered),
-            // so relabeling does NOT reorder the bytes REAPER receives (verified live —
-            // the relabel changed nothing downstream). The correction is done in REAPER.
+            // 2026-06-17 with the channel-ID test files. Do NOT try to correct it here —
+            // the correction is done in REAPER, by standing rule.
+            // ⚠ `position` is LOAD-BEARING, not cosmetic: source_router links a source into
+            // dsp-in by channel NAME, so this list picks the dsp-in lane each captured lane
+            // lands on, and since 2026-08-23 dsp-in lane N is NDI channel N. Relabeling here
+            // DOES move channels at the receiver.
             position: "[ FL FR FC LFE RL RR ]",
             hw_params: None,
             slave_measured: false,
@@ -472,8 +474,10 @@ fn source_cfg(src: &str) -> Option<SourceCfg> {
         // CHANNELS: [2 8]). Reading 6 collected 4 populated lanes plus 2 empty ones and
         // discarded the surrounds entirely. Quiet lanes stay digitally silent, so 8 is
         // unconditional — no channel-count detection to flap on quiet passages.
-        // ⛔ `position` is NOMINAL: it exists so the node has an 8ch layout. Lanes are
-        // passed through exactly as captured and REAPER maps them. Do not "fix" it here.
+        // ⛔ `position` is canonical CH8 in order, which makes the name-based link into
+        // dsp-in the IDENTITY — so lanes pass through exactly as captured, and since
+        // 2026-08-23 captured lane N is NDI channel N. It is not cosmetic: reordering this
+        // list would move channels. REAPER maps them. Do not "fix" it here.
         "tv" => Some(SourceCfg {
             name: "tv",
             card: "eARC",

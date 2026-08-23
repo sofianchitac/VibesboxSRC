@@ -390,6 +390,12 @@ class SourceRouter:
                         idx = int(m.group(1))
                         if 1 <= idx <= len(CH8):
                             ch = CH8[idx - 1]
+                # ndi-tx-in is keyed positionally too, by port.id — its port NAMES are
+                # deliberately ignored. See the dsp-out -> ndi-tx-in note in reconcile().
+                elif node_id_name.get(nid) == NDI_TX_NODE:
+                    pidx = p.get("port.id")
+                    ch = (CH8[int(pidx)]
+                          if pidx is not None and 0 <= int(pidx) < len(CH8) else None)
                 if not ch:
                     continue
                 table = out_ports if direction == "output" else in_ports
@@ -947,11 +953,19 @@ class SourceRouter:
                     # CH6 loop silently left lanes 7-8 unlinked (i.e. the surrounds the
                     # chain was widened to keep). Safe at either width: the membership
                     # test below only links ports that actually exist on both nodes.
-                    # Linking by NAME is linking by INDEX here: measured 2026-08-21, the
-                    # ALSA `pipewire` plugin's 8ch capture stream exposes exactly
-                    # FL FR FC LFE RL RR SL SR, the same list and the same order as the
-                    # sink — so neither consumer reorders a lane. ⛔ If that ever stops
-                    # being true the fix is positional linking, never a remap.
+                    # ★ POSITIONAL: dsp-out lane N goes to the transmitter's lane N, so
+                    # CamillaDSP channel N is NDI channel N. _index() keys BOTH sides by
+                    # port index and ignores ndi-tx-in's port names, because they are not
+                    # in the order they look like: MEASURED 2026-08-23, the ALSA `pipewire`
+                    # plugin's 8ch capture stream exposes ALSA's own order,
+                    # FL FR RL RR FC LFE SL SR. Name-matching against that sent dsp-out 3/4
+                    # to NDI 5/6 and dsp-out 5/6 to NDI 3/4 — the exact inverse of the
+                    # (FC,LFE)<->(RL,RR) scramble the TV-bitstream and USB sources carry, so
+                    # from 753ee08 (2026-08-21) until this change the NDI wire silently
+                    # un-scrambled them and REAPER's corrective remap ran on already-correct
+                    # audio. The retired hw:NDITX,1,0 loopback was positional for free
+                    # (unpositioned aloop ports); this restores that, and is immune to
+                    # either side's naming. ⛔ Never fix a lane order with a remap here.
                     for ch in CH8:
                         if ch in src_p and ch in dst_p:
                             desired.add((src_p[ch], dst_p[ch]))

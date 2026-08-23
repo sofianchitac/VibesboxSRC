@@ -7,8 +7,10 @@
 # We advertise the standard 5.1 mask 0x3F (FL FR FC LFE RL RR), but NOTE: iPadOS/macOS
 # IGNORE this mask and emit 5.1 in a FIXED stream order — a SMPTE file (L R C LFE Ls Rs)
 # arrives as L R Ls Rs C LFE, center & LFE last (proven 2026-06-17 with the channel-ID
-# test files). This is NOT correctable on the Pi (PipeWire position labels don't reorder
-# the index-ordered NDI wire); the channel correction is done downstream in REAPER.
+# test files). The channel correction is done downstream in REAPER, by standing rule.
+# ⚠ Not because a Pi-side relabel would be inert: source_router links a source into dsp-in
+# by channel NAME, and since 2026-08-23 dsp-in lane N is NDI channel N, so a bridge's
+# `position` list DOES move channels at the receiver. It is a rule, not a limitation.
 #
 # Multi-rate support for c_srate/p_srate requires Linux kernel >= 5.18.
 # Pi 4B with Raspberry Pi OS Bookworm ships kernel 6.x — fully supported.
