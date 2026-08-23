@@ -74,6 +74,12 @@ DRAIN_MAX_S         = float(os.environ.get("NDI_DRAIN_MAX_S",   "3.0"))
 # summary line; 0 disables. Costs one avail() ioctl per period (~188/s) and one log line
 # per window, so it is cheap enough to leave on in production.
 TELEMETRY_S    = float(os.environ.get("NDI_TELEMETRY_S", "5.0"))
+# Runtime backlog trim — see trim_standing_backlog(). Rides on the telemetry window
+# above (it needs the distribution to tell a standing residual from a sawtooth peak),
+# so NDI_TELEMETRY_S=0 disables the trim too. Cooldown is per trim attempt; the cap
+# bounds one attempt at a couple of periods more than the buffer can actually hold.
+TRIM_COOLDOWN_S  = float(os.environ.get("NDI_TRIM_COOLDOWN_S",  "30.0"))
+TRIM_MAX_PERIODS = int(os.environ.get("NDI_TRIM_MAX_PERIODS",   "4"))
 NDI_NAME       = os.environ.get("NDI_TX_NAME",    "VibesboxSRC-5.1")
 
 ALSA_OPEN_RETRIES    = 30     # attempts before giving up
@@ -192,7 +198,27 @@ def open_alsa_capture() -> alsaaudio.PCM:
     )
 
 
-def drain_capture_backlog(pcm: alsaaudio.PCM) -> None:
+def granted_period(pcm: alsaaudio.PCM) -> int:
+    """The period size ALSA actually GRANTED, which is what every threshold must use.
+
+    ⚠ Not PERIOD_FRAMES. The two differ on the live Pi: the code default is 1024, the
+    unit sets NDI_PERIOD=512, and the device string's PERIOD_BYTES=16384 is what really
+    pins the grant to 512 frames at 8ch x 4B. A threshold built on the requested size
+    would silently move if that env override were ever dropped.
+
+    Defensive: this runs inside the production transmitter and an exception here would
+    take NDI output down entirely. A wrong-but-sane size is survivable; a crash is not.
+    (pyalsaaudio 0.11.0 on the Pi does provide period_size.)
+    """
+    try:
+        return int(pcm.info().get("period_size") or 0) or PERIOD_FRAMES
+    except Exception as exc:
+        logging.warning(f"could not read the granted period_size ({exc}); "
+                        f"falling back to the requested {PERIOD_FRAMES}.")
+        return PERIOD_FRAMES
+
+
+def drain_capture_backlog(pcm: alsaaudio.PCM, period_frames: int) -> None:
     """Discard whatever is already sitting in the capture buffer before going live.
 
     ✅ Written for snd-aloop, verified against the `pipewire` plugin on 2026-08-21: it
@@ -223,20 +249,10 @@ def drain_capture_backlog(pcm: alsaaudio.PCM) -> None:
     the blocking read we already do: a period served out of backlog returns
     immediately, whereas a period at the live edge cannot arrive faster than real time.
     We discard until a read actually blocks — that is the moment the backlog is gone.
-    (An avail()-based version would be tidier but is not portable across pyalsaaudio
-    versions, and this runs once per open.)
+    (The runtime trim below does use avail() — it works fine on this install. This one
+    stays timing-based because it must run BEFORE the stream has started, where avail()
+    has nothing to report yet.)
     """
-    # ⚠ Use the GRANTED period, not PERIOD_FRAMES: the two can differ, and using the
-    # requested size would move the threshold and call live audio "backlog".
-    # Defensive: this runs inside the production transmitter, and an exception here
-    # would take NDI output down entirely. A wrong-but-sane threshold is survivable;
-    # a crash is not. (pyalsaaudio 0.11.0 on the Pi does provide period_size.)
-    try:
-        period_frames = int(pcm.info().get("period_size") or 0) or PERIOD_FRAMES
-    except Exception as exc:
-        logging.warning(f"drain: could not read period_size ({exc}); "
-                        f"falling back to the requested {PERIOD_FRAMES}.")
-        period_frames = PERIOD_FRAMES
     period_s = period_frames / SAMPLE_RATE
     live_threshold = period_s * DRAIN_LIVE_FRACTION
     deadline = time.monotonic() + DRAIN_MAX_S
@@ -286,6 +302,44 @@ def drain_capture_backlog(pcm: alsaaudio.PCM) -> None:
         logging.info("drain: capture was already at the live edge, nothing to discard.")
 
 
+def trim_standing_backlog(pcm: alsaaudio.PCM, period_frames: int) -> int:
+    """Discard whole periods of STANDING residual backlog. Returns frames discarded.
+
+    ★ Why this exists (measured 2026-08-23). The reader's residual RATCHETS: it sits at
+    0 for minutes, steps up by exactly one granted period, and never comes back down.
+    Observed live at 11:48:40 after 11 clean minutes, then held; a previous step held
+    ~33 h and cost real latency. The open-time drain_capture_backlog() cannot help —
+    it runs once, at open, and the step happens mid-run. Nothing else looked.
+
+    The step's own trigger is NOT observable from here: no ALSA error, no xrun, no
+    journal entry at that minute. So this does not prevent the step, it REMOVES it —
+    the residual is bounded by the buffer (2 periods), which is why it is worth
+    removing rather than diagnosing first.
+
+    ⚠ The cost is honest and must not be hidden: discarding a period splices the
+    stream. One period at 96 kHz is 5.33 ms. That is the same trade the upstream
+    ardftsrc backlog trim already makes, and it buys back 5.33 ms of otherwise
+    permanent latency per period removed.
+
+    SAFETY: the caller's window statistic only decides whether to TRY. Every discard
+    is gated on a live avail() re-check, so this can never read into live audio and
+    cause an underrun — at worst it does nothing.
+    """
+    discarded = 0
+    try:
+        for _ in range(TRIM_MAX_PERIODS):
+            if pcm.avail() < period_frames:
+                break
+            length, _ = pcm.read()
+            if length <= 0:
+                break
+            discarded += length
+    except Exception as exc:
+        # Never let the trim take NDI output down; a missed trim is survivable.
+        logging.warning(f"trim: aborted after {discarded} frames: {exc}")
+    return discarded
+
+
 # ── Main transmitter loop ──────────────────────────────────────────────────────
 
 def run():
@@ -311,7 +365,8 @@ def run():
 
     # ── Open ALSA capture ─────────────────────────────────────────────────────
     pcm = open_alsa_capture()
-    drain_capture_backlog(pcm)
+    period_frames = granted_period(pcm)
+    drain_capture_backlog(pcm, period_frames)
 
     # ── NDI audio frame (reused every period) ────────────────────────────────
     frame = NDIlib_audio_frame_v3_t()
@@ -346,6 +401,8 @@ def run():
     avail_samples = []          # [tx window] telemetry, see the capture loop
     frames_sent   = 0
     tele_t0       = time.monotonic()
+    last_trim_t   = 0.0         # monotonic; 0 = never trimmed
+    trim_streak   = 0           # consecutive windows that trimmed — see the warning
 
     while True:
         try:
@@ -363,7 +420,8 @@ def run():
                     pcm = open_alsa_capture()
                     # Same drain as at startup: this reopen follows an error burst,
                     # so the loopback has been filling unread for at least as long.
-                    drain_capture_backlog(pcm)
+                    period_frames = granted_period(pcm)
+                    drain_capture_backlog(pcm, period_frames)
                     consecutive_errors = 0
                 except RuntimeError as e:
                     logging.error(str(e))
@@ -424,12 +482,57 @@ def run():
                 def _q(p):                 # nearest-rank percentile, no numpy dependency
                     return s[min(len(s) - 1, int(len(s) * p))]
                 ms = 1000.0 / SAMPLE_RATE
+
+                # ── standing-residual trim ────────────────────────────────────
+                # ⚠ Gate on p10, NEVER on max. This window's own data is the
+                # discriminator: a standing residual reads 512/512/512 max=512, a
+                # transient blip reads 0/0/0 max=512. Gating on max would splice the
+                # stream on every blip. Trim before logging so the line reports it.
+                #
+                # p10 deliberately does NOT fire on the window the step lands in (that
+                # window reads 0/512/512 — half of it was clean, so it is ambiguous).
+                # It fires on the NEXT one, 5 s later, and only if the residual really
+                # stood; a transient that self-clears never fires at all. The ratchet
+                # has held for 33 h, so a 5 s deferral is free. Do not lower this gate
+                # to catch the step window — that trades a guarantee for nothing.
+                # ⚠ trim_streak resets ONLY when the residual is genuinely gone, never
+                # merely because we are inside the cooldown. With a 30 s cooldown and 5 s
+                # windows, resetting in the cooldown branch would pin the streak at 1 and
+                # the runaway-writer warning below could never fire.
+                trimmed = 0
+                if _q(0.1) < period_frames:
+                    trim_streak = 0
+                elif now - last_trim_t >= TRIM_COOLDOWN_S:
+                    trimmed = trim_standing_backlog(pcm, period_frames)
+                    last_trim_t = now
+                    if trimmed:
+                        trim_streak += 1
+                        logging.info(
+                            f"trim: discarded {trimmed}f ({trimmed*ms:.1f}ms) of standing "
+                            f"backlog — residual had stood at p10={_q(0.1)}f "
+                            f"({_q(0.1)*ms:.1f}ms) for the whole window."
+                        )
+                        if trim_streak >= 3:
+                            logging.warning(
+                                f"trim: fired {trim_streak} windows running. The residual is "
+                                f"being REBUILT, not ratcheted once — suspect the writer "
+                                f"running fast, which is a different problem to this one."
+                            )
+                    else:
+                        # p10 said standing, the live re-check disagreed: it drained on
+                        # its own between the last sample and now.
+                        trim_streak = 0
+
+                # ⚠ `trim=` is reported SEPARATELY, never folded into `sent=`. `sent=` is
+                # the "did this window stall" witness; note it alternates 937/938 periods
+                # naturally (187.5 reads/s at 512f), so a 512f-short window is the 5 s
+                # boundary landing differently, NOT a missed deadline.
                 logging.info(
                     f"[tx window] availp10/50/90={_q(0.1)}/{_q(0.5)}/{_q(0.9)}f"
                     f"({_q(0.1)*ms:.1f}/{_q(0.5)*ms:.1f}/{_q(0.9)*ms:.1f}ms) "
                     f"max={s[-1]}f({s[-1]*ms:.1f}ms) n={len(s)} "
                     f"sent={frames_sent}f({frames_sent*ms/1000.0:.2f}s) "
-                    f"wall={now - tele_t0:.2f}s"
+                    f"trim={trimmed}f wall={now - tele_t0:.2f}s"
                 )
                 avail_samples.clear()
                 frames_sent = 0
