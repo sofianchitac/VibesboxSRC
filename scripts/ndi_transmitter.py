@@ -83,11 +83,26 @@ TELEMETRY_S    = float(os.environ.get("NDI_TELEMETRY_S", "5.0"))
 # bounds one attempt at a couple of periods more than the buffer can actually hold.
 TRIM_COOLDOWN_S  = float(os.environ.get("NDI_TRIM_COOLDOWN_S",  "30.0"))
 TRIM_MAX_PERIODS = int(os.environ.get("NDI_TRIM_MAX_PERIODS",   "4"))
+# Delay-setpoint thermostat (2026-08-24 splice qualification session): the pipewire
+# plugin's delay estimate steps between per-instance STATES (~0.2 / 2.2 / 4.2 ms
+# measured), each state adding real forward latency, and a live-edge splice steps
+# BOTH delay() and the measured forward leg down and it stays down. This control
+# loop trims those states back to a setpoint: if delayp50 stands above
+# SETPOINT_DELAY_F for two consecutive windows WHILE the avail residual is clean
+# (surplus belongs to trim_standing_backlog above), discard ONE period at the
+# live edge. Cost per firing: one audible ~5.33 ms splice. "0" disables.
+SETPOINT_TRIM       = os.environ.get("NDI_SETPOINT_TRIM",       "1")   != "0"
+SETPOINT_DELAY_F    = int(os.environ.get("NDI_SETPOINT_DELAY_F",    "128"))
+SETPOINT_COOLDOWN_S = float(os.environ.get("NDI_SETPOINT_COOLDOWN_S", "30.0"))
 # snd_pcm_delay() telemetry - see locate_pcm_handle(). "0" disables only the delay
 # read-out; the avail() telemetry above is independent of it.
 DELAY_TELEMETRY  = os.environ.get("NDI_DELAY_TELEMETRY", "1") != "0"
 # Phase-2 b2tx watermark (bridge-write -> tx-read latency, see read_stamp_record).
 B2TX_TELEMETRY   = os.environ.get("NDI_B2TX_TELEMETRY",  "1") != "0"
+# Seconds after an instance anchor before b2tx samples are trusted: the new
+# instance's audio needs ~100-150 ms to traverse the pipe, and windows that
+# straddle the switch are garbage. 2 s covers it with margin.
+B2TX_SETTLE_S    = float(os.environ.get("NDI_B2TX_SETTLE_S", "2.0"))
 NDI_NAME       = os.environ.get("NDI_TX_NAME",    "VibesboxSRC-5.1")
 
 ALSA_OPEN_RETRIES    = 30     # attempts before giving up
@@ -561,6 +576,18 @@ def run():
     b2tx_samples    = []        # per-period b2tx ms, one window's worth
     stamp_new_this_window = False
     stamp_inst_changes    = 0
+    stamp_anchor_mono     = None   # monotonic s of last (re)anchor — settle gate
+
+    # SIGUSR1 = discard ONE period at the live edge (deliberate splice). Debug /
+    # regulator-qualification actuator: the standing-backlog trim can only fire
+    # when surplus is present; this one drops at the live edge unconditionally,
+    # costing an audible 5.33 ms splice, to prove the forward leg steps down.
+    splice_req = False
+    splice_why = "SIGUSR1"
+    def _request_splice(sig, _frm):
+        nonlocal splice_req
+        splice_req = True
+    signal.signal(signal.SIGUSR1, _request_splice)
 
     # ── NDI audio frame (reused every period) ────────────────────────────────
     frame = NDIlib_audio_frame_v3_t()
@@ -600,6 +627,8 @@ def run():
     tele_t0       = time.monotonic()
     last_trim_t   = 0.0         # monotonic; 0 = never trimmed
     trim_streak   = 0           # consecutive windows that trimmed — see the warning
+    setpoint_streak = 0         # consecutive windows with delay above setpoint
+    last_splice_t   = 0.0       # monotonic; thermostat cooldown clock
 
     while True:
         try:
@@ -638,6 +667,20 @@ def run():
 
         if length == 0:
             # No data yet (shouldn't happen in PCM_NORMAL mode, but be safe)
+            continue
+
+        # ── live-edge splice (SIGUSR1) ────────────────────────────────────────
+        # Drop the period we just read instead of sending it. Counted in
+        # `consumed` like every frame that crosses this reader; NOT counted in
+        # frames_sent, so `sent=` stays an honest stall witness.
+        if splice_req:
+            splice_req = False
+            consumed += length
+            logging.info(
+                f"splicetrim[{splice_why}]: discarded {length}f "
+                f"({length*1000.0/SAMPLE_RATE:.2f}ms) at the live edge — forward leg "
+                f"should step down by the same amount."
+            )
             continue
 
         # data is bytes: FLOAT32LE interleaved, shape (length × ALSA_CHANNELS)
@@ -709,6 +752,7 @@ def run():
                                 stamp_ts.clear()
                                 b2tx_samples.clear()
                                 stamp_inst_changes += 1
+                                stamp_anchor_mono = time.monotonic()
                             elif seq != stamp_last_seq and stamp_delta is not None:
                                 stamp_last_seq = seq
                                 stamp_new_this_window = True
@@ -718,9 +762,11 @@ def run():
                                     del stamp_ws[:_STAMP_KEEP // 2]
                                     del stamp_ts[:_STAMP_KEEP // 2]
                             # Latency of the period just read: interpolate the
-                            # timeline at the read edge. Needs two stamps; before
-                            # that, an instance's first window simply has no keys.
-                            if len(stamp_ws) >= 2:
+                            # timeline at the read edge. Needs two stamps AND the
+                            # settle window — before that, this instance's audio
+                            # has not reached us yet and the mapping is garbage.
+                            if (len(stamp_ws) >= 2 and stamp_anchor_mono is not None
+                                    and time.monotonic() - stamp_anchor_mono >= B2TX_SETTLE_S):
                                 target = consumed + stamp_delta
                                 i = bisect.bisect_left(stamp_ws, target)
                                 if i <= 0:
@@ -787,6 +833,31 @@ def run():
                         # p10 said standing, the live re-check disagreed: it drained on
                         # its own between the last sample and now.
                         trim_streak = 0
+
+                # ── delay-setpoint thermostat ─────────────────────────────────
+                # ⚠ Fires only on a CLEAN residual (_q(0.1) < period): surplus in
+                # the buffer is the avail-trim's job above — firing here too would
+                # double-splice the same fault. Two consecutive windows above the
+                # setpoint before acting, so a transient delay blip never clicks.
+                # One splice per cooldown; each costs one audible ~5.33 ms splice.
+                if SETPOINT_TRIM and delay_samples:
+                    dsp = sorted(delay_samples)
+                    dp50 = dsp[min(len(dsp) - 1, int(len(dsp) * 0.5))]
+                    if dp50 <= SETPOINT_DELAY_F or _q(0.1) >= period_frames:
+                        setpoint_streak = 0
+                    elif now - last_splice_t >= SETPOINT_COOLDOWN_S:
+                        setpoint_streak += 1
+                        if setpoint_streak >= 2:
+                            splice_req = True
+                            splice_why = "setpoint"
+                            last_splice_t = now
+                            logging.warning(
+                                f"setpoint: delayp50 stood at {dp50}f ({dp50*ms:.2f}ms) "
+                                f"above setpoint {SETPOINT_DELAY_F}f for {setpoint_streak} "
+                                f"windows with clean avail — splicing one period."
+                            )
+                    else:
+                        pass   # above setpoint but inside cooldown; keep streak
 
                 # ⚠ `trim=` is reported SEPARATELY, never folded into `sent=`. `sent=` is
                 # the "did this window stall" witness; note it alternates 937/938 periods
