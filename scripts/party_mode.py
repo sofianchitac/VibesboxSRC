@@ -64,7 +64,11 @@ CDSP_WS   = "ws://127.0.0.1:1234"
 # respondent carries that SKU (three H7020s on this LAN means the bulbs NEED
 # their pinned id).
 DEVICES = [
-    {"id": "1D:6F:C5:75:2E:0E:7F:8A", "sku": "H70B3",  "label": "curtain"},
+    # Curtain: washes out to white when driven hard, so cap lower; floor -50 dB
+    # makes quieter passages still move the effect.
+    {"id": "1D:6F:C5:75:2E:0E:7F:8A", "sku": "H70B3",  "label": "curtain",
+     "floor_db": -50.0, "max_brightness": 70,
+     "vol_span": 4},   # near-dark between beats; it washes out if it idles high
     # Identified 2026-08-24 by devStatus watch while toggling in the Govee app:
     # the only one of three LAN H7020s that flipped (BLE MAC 60:74:F4:A5:A6:9C).
     # "scene" pins its idle look to an app SCENE ("Illumination"): scenes are
@@ -74,7 +78,7 @@ DEVICES = [
     # activated via the undocumented ptReal LAN command (BLE frame, XOR-19 checksum;
     # verified live 2026-08-24).
     {"id": "74:49:D6:37:30:33:6F:48", "sku": "H7020",  "label": "bulbs",
-     "scene": 63},
+     "scene": 63, "max_brightness": 100},
 ]
 
 SCAN_PORT         = 4001    # client -> devices (scan, unicast sweep)
@@ -93,10 +97,15 @@ MAX_BRIGHTNESS   = 80      # the LEDs wash out to white near full power
 BEAT_RATIO       = 1.10    # instantaneous vs rolling-average onset threshold
 BEAT_FLOOR       = 0.08    # ignore onsets below this intensity (noise gate)
 BEAT_REFRACTORY  = 0.22    # min seconds between detected beats
-BEAT_DECAY       = 0.75    # pulse envelope decay per tick
-SILENCE_LEVEL    = 0.02    # below this intensity the room counts as silent...
-SILENCE_OFF_S    = 8.0     # ...for this long -> lights fully OFF
-SILENCE_RESUME   = 0.05    # intensity that wakes the lights back up
+BEAT_DECAY       = 0.80    # pulse envelope decay per tick (~300ms half-life)
+# Brightness mix: BEAT-driven, not volume-driven (user tuning 2026-08-24 —
+# volume owns the colour ramp; brightness just idles near BRI_BASE and PUNCHES
+# on beats).
+BRI_BASE         = 0       # silent rooms go dark; only beats light up
+BRI_VOL_SPAN     = 12      # gentle lift with loudness
+BRI_BEAT_SPAN    = 80      # the punch
+SILENCE_MARGIN_DB = 2.0   # below (floor + this) the room counts as silent...
+SILENCE_OFF_S     = 8.0   # ...for this long -> lights fully OFF
 POWERON_SETTLE_S = 0.3     # wait after turn-on before streaming (device drops early cmds)
 STATUS_TIMEOUT_S = 2.0     # devStatus reply wait
 
@@ -266,6 +275,68 @@ class GoveeLink(asyncio.DatagramProtocol):
             self.transport.close()
 
 
+class DeviceEngine:
+    """Per-device intensity mapping: its own floor, brightness cap, auto-gain
+    window and beat envelope — the curtain and the bulbs need very different
+    response curves from the same signal."""
+
+    def __init__(self, cfg: dict):
+        self.label = cfg["label"]
+        self.floor_db = cfg.get("floor_db", LEVEL_FLOOR_DB)
+        self.max_bri = cfg.get("max_brightness", MAX_BRIGHTNESS)
+        self.vol_span = cfg.get("vol_span", BRI_VOL_SPAN)
+        self.window = []            # ~30 s auto-gain window (normalised units)
+        self.history = []           # rolling window for onset detection
+        self.smooth = 0.0
+        self.beat_env = 0.0
+        self.last_beat_t = float("-inf")
+
+    def reset(self):
+        self.window.clear()
+        self.history.clear()
+        self.smooth = 0.0
+        self.beat_env = 0.0
+
+    def update(self, db: float, now: float):
+        """Feed one loudness sample (dBFS); returns (brightness, rgb)."""
+        raw = _clamp((db - self.floor_db) / (0.0 - self.floor_db), 0.0, 1.0)
+
+        # Auto-gain against the last ~30 s so the ramp rides the MUSIC's
+        # dynamics rather than absolute level (program material sits in a narrow
+        # dB band; without this the colour pins at one stop and looks static).
+        self.window.append(raw)
+        if len(self.window) > int(30.0 / TICK_S):
+            self.window.pop(0)
+        lo, hi = min(self.window), max(self.window)
+        if hi - lo < 0.15:
+            hi = lo + 0.15
+        norm = _clamp((raw - lo) / (hi - lo), 0.0, 1.0)
+
+        # smoothing on the normalised signal: fast attack, slow release
+        k = 0.45 if norm > self.smooth else 0.10
+        self.smooth += (norm - self.smooth) * k
+
+        # beat detection: onset above the rolling average, noise-gated,
+        # refractory-limited; strength feeds a decaying brightness envelope
+        self.history.append(norm)
+        if len(self.history) > 20:
+            self.history.pop(0)
+        avg = sum(self.history) / len(self.history)
+        if (len(self.history) >= 5
+                and norm > avg * BEAT_RATIO + 0.01
+                and norm > BEAT_FLOOR
+                and now - self.last_beat_t >= BEAT_REFRACTORY):
+            strength = _clamp((norm - avg) * 3.0, 0.25, 1.0)
+            self.beat_env = min(1.0, self.beat_env + strength * 0.85)
+            self.last_beat_t = now
+        self.beat_env *= BEAT_DECAY
+
+        bri = int(_clamp(BRI_BASE + self.smooth * self.vol_span
+                         + self.beat_env * BRI_BEAT_SPAN,
+                         1, self.max_bri))
+        return bri, _ramp_color(self.smooth)
+
+
 class PartyMode:
     def __init__(self):
         self.link = GoveeLink(DEVICES)
@@ -277,16 +348,12 @@ class PartyMode:
         self.tx_rgb: dict[str, tuple | None] = {}
         self.tx_on: dict[str, bool | None] = {}
         self.turn_at: dict[str, float] = {}   # ip -> monotonic of last turn-on
-        self.last_tx_t = float("-inf")
-        # show state
-        self.raw = 0.0              # instantaneous normalised intensity
-        self.smooth = 0.0           # attack/release smoothed intensity
-        self.history = []           # rolling window for onset detection
-        self.window = []            # ~30 s auto-gain window (min/max normalisation)
-        self.beat_env = 0.0         # brightness pulse envelope
-        self.last_beat_t = float("-inf")   # no refractory on the very first beat
+        self.last_tx_t: dict[str, float] = {d["label"]: float("-inf") for d in DEVICES}
+        # signal state (shared) + per-device engines
+        self.db = LEVEL_FLOOR_DB - 70.0     # loudest-channel dBFS from CamillaDSP
         self.silent_for = 0.0
         self.lights_off = False     # silenced off (vs party-active lit)
+        self.engines = {d["label"]: DeviceEngine(d) for d in DEVICES}
 
     # ------------------------------------------------------------------ #
     #  SourceRouter :8080 consumer                                        #
@@ -324,13 +391,11 @@ class PartyMode:
                         if r and r.get("result") == "Ok" and isinstance(r.get("value"), list):
                             vals = [v for v in r["value"] if isinstance(v, (int, float))]
                             # loudest channel; CamillaDSP reports true silence as -1000 dB
-                            db = max(vals) if vals else LEVEL_FLOOR_DB - 70.0
-                            self.raw = _clamp((db - LEVEL_FLOOR_DB) / (0.0 - LEVEL_FLOOR_DB),
-                                              0.0, 1.0)
+                            self.db = max(vals) if vals else LEVEL_FLOOR_DB - 70.0
                         await asyncio.sleep(TICK_S)
             except Exception as exc:
                 log.warning(f"CamillaDSP unreachable ({exc}); retrying")
-                self.raw = 0.0
+                self.db = LEVEL_FLOOR_DB - 70.0
                 await asyncio.sleep(3)
 
     # ------------------------------------------------------------------ #
@@ -361,9 +426,8 @@ class PartyMode:
             self.turn_at[ip] = time.monotonic()
         self.active = True
         self.lights_off = False
-        self.smooth = self.beat_env = 0.0
-        self.history.clear()
-        self.window.clear()
+        for eng in self.engines.values():
+            eng.reset()
         self.silent_for = 0.0
         self.tx_bri = {}
         self.tx_rgb = {}
@@ -424,39 +488,40 @@ class PartyMode:
     #  Show engine (10 Hz)                                                #
     # ------------------------------------------------------------------ #
 
-    def _transmit(self, on, bri=None, rgb=None):
+    def _transmit_one(self, ip, label, on, bri=None, rgb=None):
+        """Change-gated packet to ONE device. A turn-on is sent ALONE and values
+        wait out POWERON_SETTLE_S — the ESP drops commands that arrive too soon
+        after a power transition (same quirk the restore path spaces around)."""
         now = time.monotonic()
-        if now - self.last_tx_t < MIN_TX_GAP_S:
+        if now - self.last_tx_t.get(label, float("-inf")) < MIN_TX_GAP_S:
             return
-        for ip in self.link.resolved:
-            # A turn-on is sent ALONE and values wait out POWERON_SETTLE_S — the
-            # ESP drops commands that arrive too soon after a power transition
-            # (same quirk the restore path spaces around).
-            if on != self.tx_on.get(ip):
-                self.link.command_one(ip, ("turn", {"value": 1 if on else 0}))
-                self.tx_on[ip] = on
-                self.turn_at[ip] = now
-                self.last_tx_t = now
-                continue
-            if on and now - self.turn_at.get(ip, 0.0) < POWERON_SETTLE_S:
-                continue
-            changed = ((on and bri is not None
-                        and (self.tx_bri.get(ip) is None or abs(bri - self.tx_bri[ip]) >= BRI_DELTA))
-                       or (on and rgb is not None
-                           and (self.tx_rgb.get(ip) is None
-                                or max(abs(a - b) for a, b in zip(rgb, self.tx_rgb[ip])) >= COLOR_DELTA)))
-            if not changed:
-                continue
-            if on:
-                if rgb is not None:
-                    self.link.command_one(
-                        ip, ("colorwc", {"color": {"r": rgb[0], "g": rgb[1], "b": rgb[2]},
-                                         "colorTemInKelvin": 0}))
-                if bri is not None:
-                    self.link.command_one(
-                        ip, ("brightness", {"value": _clamp(bri, 1, MAX_BRIGHTNESS)}))
-            self.tx_bri[ip], self.tx_rgb[ip] = bri, rgb
-            self.last_tx_t = now
+        if on != self.tx_on.get(ip):
+            self.link.command_one(ip, ("turn", {"value": 1 if on else 0}))
+            self.tx_on[ip] = on
+            self.turn_at[ip] = now
+            self.last_tx_t[label] = now
+            return
+        if on and now - self.turn_at.get(ip, 0.0) < POWERON_SETTLE_S:
+            return
+        changed = ((on and bri is not None
+                    and (self.tx_bri.get(ip) is None or abs(bri - self.tx_bri[ip]) >= BRI_DELTA))
+                   or (on and rgb is not None
+                       and (self.tx_rgb.get(ip) is None
+                            or max(abs(a - b) for a, b in zip(rgb, self.tx_rgb[ip])) >= COLOR_DELTA)))
+        if not changed:
+            return
+        if on:
+            # rgb=None keeps the device's current look (e.g. a pinned app scene)
+            # and pulses ONLY brightness with the music.
+            if rgb is not None:
+                self.link.command_one(
+                    ip, ("colorwc", {"color": {"r": rgb[0], "g": rgb[1], "b": rgb[2]},
+                                     "colorTemInKelvin": 0}))
+            if bri is not None:
+                self.link.command_one(
+                    ip, ("brightness", {"value": _clamp(bri, 1, MAX_BRIGHTNESS)}))
+        self.tx_bri[ip], self.tx_rgb[ip] = bri, rgb
+        self.last_tx_t[label] = now
 
     async def show_loop(self):
         while True:
@@ -474,16 +539,15 @@ class PartyMode:
         now = time.monotonic()
 
         # silence gate: full OFF after SILENCE_OFF_S of quiet, back on at resume
-        if self.raw < SILENCE_LEVEL:
+        silent_now = self.db < LEVEL_FLOOR_DB + SILENCE_MARGIN_DB
+        if silent_now:
             self.silent_for += TICK_S
         else:
-            if self.lights_off and self.raw >= SILENCE_RESUME:
+            if self.lights_off and not silent_now:
                 self.lights_off = False
                 for ip in self.link.resolved:
                     self.tx_on[ip] = None      # force a fresh turn-on packet
-                self.silent_for = 0.0
-            else:
-                self.silent_for = 0.0
+            self.silent_for = 0.0
         if self.silent_for >= SILENCE_OFF_S and not self.lights_off:
             self.lights_off = True
             self.link.command(("turn", {"value": 0}))
@@ -493,50 +557,23 @@ class PartyMode:
         if self.lights_off:
             return
 
-        # Auto-gain: normalise raw against the min/max of the last ~30 s, so the
-        # full colour ramp rides the MUSIC's dynamics instead of its absolute
-        # level (program material sits in a narrow dB band; without this smooth
-        # pins at one colour and the show looks static — observed live
-        # 2026-08-24: raw parked at 0.75-0.85 => constant warm white).
-        self.window.append(self.raw)
-        if len(self.window) > int(30.0 / TICK_S):      # ~300 samples
-            self.window.pop(0)
-        lo, hi = min(self.window), max(self.window)
-        if hi - lo < 0.15:                             # floor the spread so quiet
-            hi = lo + 0.15                             # passages still get range
-        norm = _clamp((self.raw - lo) / (hi - lo), 0.0, 1.0)
-
-        # smoothing on the normalised signal: fast attack, slow release
-        k = 0.45 if norm > self.smooth else 0.10
-        self.smooth += (norm - self.smooth) * k
-
-        # beat detection: onset above the rolling average, noise-gated,
-        # refractory-limited; strength feeds a decaying brightness envelope
-        self.history.append(norm)
-        if len(self.history) > 20:                     # ~2 s at 10 Hz
-            self.history.pop(0)
-        avg = sum(self.history) / len(self.history)
-        if (len(self.history) >= 5
-                and norm > avg * BEAT_RATIO + 0.01
-                and norm > BEAT_FLOOR
-                and now - self.last_beat_t >= BEAT_REFRACTORY):
-            strength = _clamp((norm - avg) * 3.0, 0.25, 1.0)
-            self.beat_env = min(1.0, self.beat_env + strength * 0.6)
-            self.last_beat_t = now
-        self.beat_env *= BEAT_DECAY
-
-        bri = int(_clamp(10 + self.smooth * 65 + self.beat_env * 25,
-                         1, MAX_BRIGHTNESS))
-        rgb = _ramp_color(self.smooth)
-        self._transmit(True, bri=bri, rgb=rgb)
+        # per-device engines: same loudness sample, different response curves
+        for ip, label in self.link.resolved.items():
+            eng = self.engines[label]
+            bri, rgb = eng.update(self.db, now)
+            if self.link.scene_by_label.get(label) is not None:
+                rgb = None    # pulse_scene: keep the scene's look, brightness only
+            self._transmit_one(ip, label, True, bri=bri, rgb=rgb)
 
         # one-line engine heartbeat every ~5 s — makes "why is nothing happening"
         # answerable from journalctl alone.
         self._dbg_n = getattr(self, "_dbg_n", 0) + 1
         if self._dbg_n % 50 == 0:
-            log.info(f"tick: raw={self.raw:.2f} norm={norm:.2f} "
-                     f"[{lo:.2f}-{hi:.2f}] smooth={self.smooth:.2f} "
-                     f"beat={self.beat_env:.2f} bri={bri} rgb={rgb}")
+            parts = [f"db={self.db:.1f}"]
+            for label, eng in self.engines.items():
+                parts.append(f"{label}: smooth={eng.smooth:.2f} "
+                             f"beat={eng.beat_env:.2f}")
+            log.info("tick: " + " | ".join(parts))
 
 
 async def main():
