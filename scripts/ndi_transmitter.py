@@ -513,7 +513,14 @@ _STAMP_KEEP   = 8192    # retained stamps (~5 min of timeline for interpolation)
 
 
 def open_stamp_mmap():
-    """mmap the shared record read-only, or None (bridge not running yet)."""
+    """mmap the shared record read-only, or None (bridge not running yet).
+
+    ⛔ This mapping lives for the LIFE of the process. If the file were ever
+    truncated under it, the next read would die by SIGBUS — uncatchable from
+    Python (ndi-output crash-looped 13:40–13:51 on 2026-08-24 from exactly
+    this; see stamp.rs on the writer side). Never truncate there, never
+    re-open/remap here except through this function's None-returning failure
+    path, which maps afresh only when the previous handle was never created."""
     try:
         f = os.open(STAMP_SHM, os.O_RDONLY)
         return mmap.mmap(f, _STAMP_SIZE, access=mmap.ACCESS_READ)
@@ -629,6 +636,8 @@ def run():
     trim_streak   = 0           # consecutive windows that trimmed — see the warning
     setpoint_streak = 0         # consecutive windows with delay above setpoint
     last_splice_t   = 0.0       # monotonic; thermostat cooldown clock
+    setpoint_splice_run = 0     # setpoint splices since delay was last under setpoint
+    setpoint_standdown  = False # decoupling guard: gauge blind to the correction?
 
     while True:
         try:
@@ -651,6 +660,10 @@ def run():
                     # New PCM object, new handle; the proven offset is reused.
                     delay_handle = locate_pcm_handle(pcm)
                     delay_errs = 0
+                    # Reopen = fresh instance from the thermostat's point of view.
+                    setpoint_standdown = False
+                    setpoint_splice_run = 0
+                    setpoint_streak = 0
                     consecutive_errors = 0
                 except RuntimeError as e:
                     logging.error(str(e))
@@ -753,6 +766,9 @@ def run():
                                 b2tx_samples.clear()
                                 stamp_inst_changes += 1
                                 stamp_anchor_mono = time.monotonic()
+                                # New draw, new chance: release the thermostat guard.
+                                setpoint_standdown = False
+                                setpoint_splice_run = 0
                             elif seq != stamp_last_seq and stamp_delta is not None:
                                 stamp_last_seq = seq
                                 stamp_new_this_window = True
@@ -840,22 +856,49 @@ def run():
                 # double-splice the same fault. Two consecutive windows above the
                 # setpoint before acting, so a transient delay blip never clicks.
                 # One splice per cooldown; each costs one audible ~5.33 ms splice.
-                if SETPOINT_TRIM and delay_samples:
+                #
+                # ⚠ DECOUPLING GUARD: the splice acts on the forward leg, the gauge
+                # reads delay(). If a correction ever lands WITHOUT moving the
+                # gauge, the trigger persists and this loop re-fires every
+                # cooldown — a click every 30 s forever on an already-fixed
+                # instance. So after TWO consecutive setpoint splices that failed
+                # to bring delayp50 under the setpoint, STAND DOWN (no more
+                # firing) until a window reads under setpoint naturally, or the
+                # device reopens, or a new bridge instance anchors — and log it
+                # loudly. Converts the worst failure mode into one error line.
+                if SETPOINT_TRIM and delay_samples and not setpoint_standdown:
                     dsp = sorted(delay_samples)
                     dp50 = dsp[min(len(dsp) - 1, int(len(dsp) * 0.5))]
                     if dp50 <= SETPOINT_DELAY_F or _q(0.1) >= period_frames:
-                        setpoint_streak = 0
+                        if dp50 <= SETPOINT_DELAY_F:
+                            # healthy again: full reset, guard included
+                            setpoint_streak = 0
+                            setpoint_splice_run = 0
+                            setpoint_standdown = False
+                        else:
+                            setpoint_streak = 0   # dirty residual; trim's domain
                     elif now - last_splice_t >= SETPOINT_COOLDOWN_S:
                         setpoint_streak += 1
                         if setpoint_streak >= 2:
-                            splice_req = True
-                            splice_why = "setpoint"
-                            last_splice_t = now
-                            logging.warning(
-                                f"setpoint: delayp50 stood at {dp50}f ({dp50*ms:.2f}ms) "
-                                f"above setpoint {SETPOINT_DELAY_F}f for {setpoint_streak} "
-                                f"windows with clean avail — splicing one period."
-                            )
+                            if setpoint_splice_run >= 2:
+                                setpoint_standdown = True
+                                logging.error(
+                                    f"setpoint: {setpoint_splice_run} consecutive "
+                                    f"splices did NOT bring delayp50 under setpoint "
+                                    f"(still {dp50}f/{dp50*ms:.2f}ms) — standing down "
+                                    f"until reopen/instance change. The gauge may be "
+                                    f"blind to what the splice corrects."
+                                )
+                            else:
+                                splice_req = True
+                                splice_why = "setpoint"
+                                last_splice_t = now
+                                setpoint_splice_run += 1
+                                logging.warning(
+                                    f"setpoint: delayp50 stood at {dp50}f ({dp50*ms:.2f}ms) "
+                                    f"above setpoint {SETPOINT_DELAY_F}f for {setpoint_streak} "
+                                    f"windows with clean avail — splicing one period."
+                                )
                     else:
                         pass   # above setpoint but inside cooldown; keep streak
 
