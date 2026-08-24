@@ -1,0 +1,18 @@
+[Unit]
+Description=Govee Party Mode (music-synced lights over the LAN API)
+# Subscribes to source-router's :8080 state (party_mode flag) and CamillaDSP's
+# :1234 RMS read — both are soft deps; the daemon retries on its own.
+After=source-router.service camilladsp.service network-online.target
+Wants=source-router.service camilladsp.service
+
+[Service]
+Type=simple
+ExecStart=/opt/vibesbox-src/venv/bin/python3 /opt/vibesbox-src/scripts/party_mode.py
+Restart=always
+RestartSec=3
+User=root
+TimeoutStopSec=10
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

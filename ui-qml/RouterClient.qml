@@ -15,6 +15,7 @@ Item {
     property real inputRate: 0             // Hz, 0 = unknown
     property string btState: "idle"
     property string btDevice: ""
+    property bool partyMode: false
 
     signal newState()
 
@@ -23,6 +24,7 @@ Item {
             sock.sendTextMessage(JSON.stringify(obj))
     }
     function toggleMute(name) { send({ command: "toggle_mute", source: name }) }
+    function setPartyMode(enabled) { send({ command: "set_party_mode", enabled: enabled }) }
     function unmuteAll() {
         for (var src in sourcesMuted)
             if (sourcesMuted[src])
@@ -50,6 +52,7 @@ Item {
             root.inputRate = msg.input_rate || 0
             root.btState = msg.bt_state || "idle"
             root.btDevice = msg.bt_device || ""
+            root.partyMode = msg.party_mode === true
             root.firstStateReceived = true
             root.newState()
         }

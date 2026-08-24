@@ -208,6 +208,12 @@ class SourceRouter:
         self._last_active    = {n: 0.0 for n in SOURCES}   # monotonic ts of last rising edge
         self.focused_source  = None
 
+        # ── Party mode (UI-driven, volatile — never persists across boot). ───
+        # Pure state flag: the QML logo tap sets it via "set_party_mode", and it
+        # rides the state frame to the UI and to party_mode.py (Govee lights).
+        # The audio chain takes no notice of it.
+        self.party_mode = False
+
         # True whenever a TV bridge could be running, so the idle path can skip
         # the systemctl status spawn entirely. Starts True: a bridge may have
         # survived a daemon restart.
@@ -1354,6 +1360,7 @@ class SourceRouter:
                         "latency_ms":        self._ui_latency_ms(),
                         "bt_state":          self.bt_state,
                         "bt_device":         self.bt_device,
+                        "party_mode":        self.party_mode,
                     }))
                     last_full_send = t0
 
@@ -1381,6 +1388,14 @@ class SourceRouter:
                             await self.toggle_mute(src)
                         else:
                             logging.warning(f"{cmd}: invalid source {data}")
+
+                    elif cmd == "set_party_mode":
+                        enabled = data.get("enabled")
+                        if isinstance(enabled, bool):
+                            self.party_mode = enabled
+                            logging.info(f"party mode {'on' if enabled else 'off'}")
+                        else:
+                            logging.warning(f"set_party_mode: invalid payload {data}")
 
                     elif cmd == "shutdown":
                         logging.info("Shutdown command from UI.")

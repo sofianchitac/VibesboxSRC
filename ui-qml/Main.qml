@@ -114,7 +114,8 @@ Window {
                 }
             }
 
-            // Header logo — tap toggles color mode (DSP LogoBadge behaviour)
+            // Header logo — tap toggles colour mode + party mode together
+            // (colour logo/meters, and music-synced Govee lights via party_mode.py)
             WakeSection {
                 id: header
                 awake: win.awake
@@ -152,7 +153,11 @@ Window {
                         // generous touch target around the slim wordmark
                         anchors.fill: parent
                         anchors.margins: -Theme.s(10)
-                        onClicked: Theme.colorMode = !Theme.colorMode
+                        onClicked: {
+                            var on = !Theme.colorMode
+                            Theme.colorMode = on
+                            router.setPartyMode(on)
+                        }
                     }
                 }
             }

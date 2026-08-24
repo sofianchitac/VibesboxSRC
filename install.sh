@@ -644,6 +644,7 @@ SERVICES=(
     nowplaying-server.service
     metadata-orchestrator.service
     fingerprint-capture.service
+    party-mode.service
     lattepanda-watcher.service
     lattepanda-watcher.timer
     tidal-connect.service
@@ -675,6 +676,7 @@ systemctl enable \
     nowplaying-server.service \
     metadata-orchestrator.service \
     fingerprint-capture.service \
+    party-mode.service \
     lattepanda-watcher.timer
 
 # NDI output: only enable if NDI SDK is present
