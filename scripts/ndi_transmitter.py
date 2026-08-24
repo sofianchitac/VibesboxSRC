@@ -42,9 +42,12 @@ Lifecycle:
 
 import ctypes
 import ctypes.util
+import bisect
 import logging
+import mmap
 import os
 import signal
+import struct
 import sys
 import time
 
@@ -83,6 +86,8 @@ TRIM_MAX_PERIODS = int(os.environ.get("NDI_TRIM_MAX_PERIODS",   "4"))
 # snd_pcm_delay() telemetry - see locate_pcm_handle(). "0" disables only the delay
 # read-out; the avail() telemetry above is independent of it.
 DELAY_TELEMETRY  = os.environ.get("NDI_DELAY_TELEMETRY", "1") != "0"
+# Phase-2 b2tx watermark (bridge-write -> tx-read latency, see read_stamp_record).
+B2TX_TELEMETRY   = os.environ.get("NDI_B2TX_TELEMETRY",  "1") != "0"
 NDI_NAME       = os.environ.get("NDI_TX_NAME",    "VibesboxSRC-5.1")
 
 ALSA_OPEN_RETRIES    = 30     # attempts before giving up
@@ -303,6 +308,9 @@ def drain_capture_backlog(pcm: alsaaudio.PCM, period_frames: int) -> None:
                      f"{periods} periods) of stale backlog before going live.")
     else:
         logging.info("drain: capture was already at the live edge, nothing to discard.")
+    # Returned so the b2tx watermark's consumed-frame counter K stays exact —
+    # drained frames crossed this reader without being counted anywhere else.
+    return frames
 
 
 def trim_standing_backlog(pcm: alsaaudio.PCM, period_frames: int) -> int:
@@ -461,6 +469,58 @@ def locate_pcm_handle(pcm):
     return None
 
 
+# ── b2tx watermark: bridge-write → tx-read latency, continuously ─────────────
+# Phase 2 per the agents-exchange (2026-08-24). The ardftsrc bridge publishes a
+# seqlock record to /dev/shm/vibesbox-ardftsrc-stamp on every output write:
+#   <u64 seq> <u64 instance> <u64 out_frames> <u64 mono_ns>
+# seq guards torn reads; instance detects a bridge RESTART (which redraws the
+# per-run draw and resets out_frames); out_frames is the cumulative 96k frame
+# count handed to the output PCM; mono_ns is CLOCK_MONOTONIC — the same clock
+# time.monotonic_ns() reads, so no clock-sync term exists.
+#
+# This side anchors its own cumulative consumed-frame counter K against that
+# timeline once per bridge instance (delta = newest out_frames − K at first
+# sight) and then interpolates the stamp timeline at the read edge each period:
+#   b2tx = read_time − stamp_time(read_edge + delta)
+# ⚠ The ABSOLUTE carries the hold that existed at anchor time — unknowable
+# passively, because the pipe between bridge and reader is always full. What is
+# EXACT is the variation: b2tx moves 1 ms for every 1 ms the true bridge-write→
+# tx-read hold moves. It replaces the audible sweep probe for this question.
+# ⚠ delta re-anchors on every new instance id, so values from different bridge
+# instances are different references — never subtract across instances. Within an
+# instance, window percentiles are comparable across hours.
+# ⚠ Multiple concurrent bridges interleave one record path; >1 instance change in
+# a single window marks it invalid (omitted keys).
+
+STAMP_SHM = "/dev/shm/vibesbox-ardftsrc-stamp"
+_STAMP_SIZE   = 32
+_STAMP_KEEP   = 8192    # retained stamps (~5 min of timeline for interpolation)
+
+
+def open_stamp_mmap():
+    """mmap the shared record read-only, or None (bridge not running yet)."""
+    try:
+        f = os.open(STAMP_SHM, os.O_RDONLY)
+        return mmap.mmap(f, _STAMP_SIZE, access=mmap.ACCESS_READ)
+    except OSError:
+        return None
+
+
+def read_stamp_record(mm):
+    """Read one record, rejecting tears by double-read stability. Returns
+    (seq, instance, out_frames, mono_ns) or None (torn / never stamped)."""
+    a = mm[:]
+    b = mm[:]
+    if a != b:
+        a = mm[:]
+        if a != mm[:]:
+            return None
+    seq, inst, frames, t_ns = struct.unpack("<QQQQ", a)
+    if seq == 0:                    # writer poisoned or not yet stamped
+        return None
+    return seq, inst, frames, t_ns
+
+
 # ── Main transmitter loop ──────────────────────────────────────────────────────
 
 def run():
@@ -487,9 +547,20 @@ def run():
     # ── Open ALSA capture ─────────────────────────────────────────────────────
     pcm = open_alsa_capture()
     period_frames = granted_period(pcm)
-    drain_capture_backlog(pcm, period_frames)
+    consumed = drain_capture_backlog(pcm, period_frames)
     # The drain's reads have started the stream, so delay() can answer now.
     delay_handle = locate_pcm_handle(pcm)
+
+    # ── b2tx watermark state (see read_stamp_record above) ───────────────────
+    stamp_mm        = open_stamp_mmap() if B2TX_TELEMETRY else None
+    stamp_cur_inst  = None      # instance currently anchored
+    stamp_last_seq  = 0
+    stamp_delta     = None      # K offset mapping the read edge onto the stamp timeline
+    stamp_ws        = []        # out_frames of retained stamps (ascending)
+    stamp_ts        = []        # their mono_ns
+    b2tx_samples    = []        # per-period b2tx ms, one window's worth
+    stamp_new_this_window = False
+    stamp_inst_changes    = 0
 
     # ── NDI audio frame (reused every period) ────────────────────────────────
     frame = NDIlib_audio_frame_v3_t()
@@ -547,7 +618,7 @@ def run():
                     # Same drain as at startup: this reopen follows an error burst,
                     # so the loopback has been filling unread for at least as long.
                     period_frames = granted_period(pcm)
-                    drain_capture_backlog(pcm, period_frames)
+                    consumed += drain_capture_backlog(pcm, period_frames)
                     # New PCM object, new handle; the proven offset is reused.
                     delay_handle = locate_pcm_handle(pcm)
                     delay_errs = 0
@@ -617,6 +688,57 @@ def run():
                         logging.warning("delay: read-out failing persistently; "
                                         "disabling until the next (re)open.")
                         delay_handle = None
+            # b2tx watermark: consumed-frame bookkeeping first — EVERY frame that
+            # crosses this reader must be counted, or the anchor drifts.
+            consumed += length
+            if B2TX_TELEMETRY:
+                try:
+                    if stamp_mm is None:
+                        stamp_mm = open_stamp_mmap()   # bridge may start any time
+                    if stamp_mm is not None:
+                        rec = read_stamp_record(stamp_mm)
+                        if rec is not None:
+                            seq, inst, w_frames, t_ns = rec
+                            if inst != stamp_cur_inst:
+                                # New bridge instance: re-anchor. From here on,
+                                # b2tx = 0 at this instant minus its own hold.
+                                stamp_cur_inst = inst
+                                stamp_last_seq = seq
+                                stamp_delta  = w_frames - consumed
+                                stamp_ws.clear()
+                                stamp_ts.clear()
+                                b2tx_samples.clear()
+                                stamp_inst_changes += 1
+                            elif seq != stamp_last_seq and stamp_delta is not None:
+                                stamp_last_seq = seq
+                                stamp_new_this_window = True
+                                stamp_ws.append(w_frames)
+                                stamp_ts.append(t_ns)
+                                if len(stamp_ws) > _STAMP_KEEP:
+                                    del stamp_ws[:_STAMP_KEEP // 2]
+                                    del stamp_ts[:_STAMP_KEEP // 2]
+                            # Latency of the period just read: interpolate the
+                            # timeline at the read edge. Needs two stamps; before
+                            # that, an instance's first window simply has no keys.
+                            if len(stamp_ws) >= 2:
+                                target = consumed + stamp_delta
+                                i = bisect.bisect_left(stamp_ws, target)
+                                if i <= 0:
+                                    w0, w1 = stamp_ws[0], stamp_ws[1]
+                                    t0, t1 = stamp_ts[0], stamp_ts[1]
+                                elif i >= len(stamp_ws):
+                                    w0, w1 = stamp_ws[-2], stamp_ws[-1]
+                                    t0, t1 = stamp_ts[-2], stamp_ts[-1]
+                                else:
+                                    w0, w1 = stamp_ws[i - 1], stamp_ws[i]
+                                    t0, t1 = stamp_ts[i - 1], stamp_ts[i]
+                                if w1 > w0:
+                                    frac = (target - w0) / (w1 - w0)
+                                    b2tx_ms = (time.monotonic_ns()
+                                               - (t0 + frac * (t1 - t0))) / 1e6
+                                    b2tx_samples.append(b2tx_ms)
+                except Exception:
+                    pass                       # never let telemetry kill the transmitter
             frames_sent += length
             now = time.monotonic()
             if now - tele_t0 >= TELEMETRY_S and avail_samples:
@@ -646,6 +768,7 @@ def run():
                     trim_streak = 0
                 elif now - last_trim_t >= TRIM_COOLDOWN_S:
                     trimmed = trim_standing_backlog(pcm, period_frames)
+                    consumed += trimmed          # discarded frames crossed this reader
                     last_trim_t = now
                     if trimmed:
                         trim_streak += 1
@@ -683,16 +806,36 @@ def run():
                     )
                 else:
                     delay_part = ""
+                # ⚠ b2tx keys are APPENDED like the delay keys. They are omitted
+                # unless the watermark is anchored, saw a stamp THIS window
+                # (bridge alive — a dead bridge would otherwise log unboundedly
+                # growing values), and did not change instance more than once
+                # (multi-source churn invalidates the anchor).
+                if (len(b2tx_samples) >= 2 and stamp_delta is not None
+                        and stamp_new_this_window and stamp_inst_changes <= 1):
+                    bs_ = sorted(b2tx_samples)
+                    def _bq(p):
+                        return bs_[min(len(bs_) - 1, int(len(bs_) * p))]
+                    b2tx_part = (
+                        f"b2txp10/50/90={_bq(0.1):.2f}/{_bq(0.5):.2f}/{_bq(0.9):.2f}ms "
+                        f"bn={len(bs_)} "
+                    )
+                else:
+                    b2tx_part = ""
                 logging.info(
                     f"[tx window] availp10/50/90={_q(0.1)}/{_q(0.5)}/{_q(0.9)}f"
                     f"({_q(0.1)*ms:.1f}/{_q(0.5)*ms:.1f}/{_q(0.9)*ms:.1f}ms) "
                     f"max={s[-1]}f({s[-1]*ms:.1f}ms) n={len(s)} "
                     f"{delay_part}"
+                    f"{b2tx_part}"
                     f"sent={frames_sent}f({frames_sent*ms/1000.0:.2f}s) "
                     f"trim={trimmed}f wall={now - tele_t0:.2f}s"
                 )
                 avail_samples.clear()
                 delay_samples.clear()
+                b2tx_samples.clear()
+                stamp_new_this_window = False
+                stamp_inst_changes = 0
                 frames_sent = 0
                 tele_t0 = now
 

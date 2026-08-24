@@ -42,6 +42,8 @@ use alsa::pcm::{Access, Format, HwParams, IO, PCM};
 use alsa::{Direction, ValueOr};
 use ardftsrc::{RealtimeResampler, PRESET_GOOD};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
+
+mod stamp;
 use ringbuf::HeapRb;
 
 const TARGET_RATE: u32 = 96_000;
@@ -1000,6 +1002,18 @@ fn main() {
     // in the ring, which is the one place the trims can reach.
     let ingest_high_water = block_out_frames + INGEST_SLACK;
     let t_start = Instant::now();
+    // ── Phase-2 latency side-channel (stamp.rs) ──────────────────────────────
+    // Publishes (cumulative out_frames, CLOCK_MONOTONIC completion time) per output
+    // write to /dev/shm so the transmitter can difference stamp against read time.
+    // Failure is non-fatal by design: one warning, audio path unaffected.
+    let mut stamp = match stamp::StampWriter::open(&t_start) {
+        Some(s) => Some(s),
+        None => {
+            eprintln!("ardftsrc-bridge: could not open {} — b2tx watermark disabled",
+                      stamp::STAMP_PATH);
+            None
+        }
+    };
     let mut first_write_done = false;
     // ── RACE RESET ──────────────────────────────────────────────────────────────────
     // Everything the bridge accumulates between capture starting and the graph actually
@@ -1442,6 +1456,17 @@ fn main() {
             out_frames_written += (whole / channels) as i64;
         }
         frame_carry.extend_from_slice(&body[whole..]);
+
+        // Watermark AFTER the writes, so the stamp says "this much audio is in the
+        // pipe as of NOW". Disabled permanently on any write failure (one warning).
+        if wrote_any {
+            if let Some(st) = stamp.as_mut() {
+                if !st.update(out_frames_written) {
+                    eprintln!("ardftsrc-bridge: stamp write failed — b2tx watermark disabled");
+                    stamp = None;
+                }
+            }
+        }
 
         if wrote_any && !first_write_done {
             first_write_done = true;

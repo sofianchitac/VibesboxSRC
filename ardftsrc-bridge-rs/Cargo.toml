@@ -38,6 +38,8 @@ ardftsrc = "0.0.16"
 alsa = "0.9"
 # Bounded SPSC ring between the capture thread and the resampler thread.
 ringbuf = "0.4"
+# clock_gettime(CLOCK_MONOTONIC) for the b2tx watermark (stamp.rs).
+libc = "0.2"
 
 # Gate 2 must measure *release* throughput — keep this representative of production.
 [profile.release]
