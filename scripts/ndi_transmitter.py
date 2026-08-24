@@ -80,6 +80,9 @@ TELEMETRY_S    = float(os.environ.get("NDI_TELEMETRY_S", "5.0"))
 # bounds one attempt at a couple of periods more than the buffer can actually hold.
 TRIM_COOLDOWN_S  = float(os.environ.get("NDI_TRIM_COOLDOWN_S",  "30.0"))
 TRIM_MAX_PERIODS = int(os.environ.get("NDI_TRIM_MAX_PERIODS",   "4"))
+# snd_pcm_delay() telemetry - see locate_pcm_handle(). "0" disables only the delay
+# read-out; the avail() telemetry above is independent of it.
+DELAY_TELEMETRY  = os.environ.get("NDI_DELAY_TELEMETRY", "1") != "0"
 NDI_NAME       = os.environ.get("NDI_TX_NAME",    "VibesboxSRC-5.1")
 
 ALSA_OPEN_RETRIES    = 30     # attempts before giving up
@@ -340,6 +343,124 @@ def trim_standing_backlog(pcm: alsaaudio.PCM, period_frames: int) -> int:
     return discarded
 
 
+# ── snd_pcm_delay() read-out, ctypes into libasound ───────────────────────────
+# WHY (ledger, standing result 2026-08-23): every instrument on the forward leg is an
+# OCCUPANCY read-out (avail, GetBufferLevel, /proc ring depth) and all of them read
+# empty across a 34.5 ms swing. snd_pcm_delay() is a different quantity: the pipewire
+# plugin's own estimate of the distance between this reader's read pointer and the
+# sample at the graph edge, including whatever the plugin/adapter holds that avail()
+# cannot see. The bridge's out= is already pcm.delay() on the OTHER end of the graph
+# and stayed flat across the swing (2194f vs 2112f at fwd 126.04 vs 91.57); this is
+# the same read-out on the one span still unmeasured, dsp-out -> this reader.
+#
+# ⚠ Interpretation guard, decided BEFORE the data exists: delay() moving with the
+# per-run draw is decisive (the draw lives on this span; trim to a setpoint next).
+# delay() FLAT is "not visible to this plugin's delay estimate", NOT an acquittal of
+# the adapter — the pipewire plugin COMPUTES delay from its own timing info and what
+# that includes has shifted across PipeWire versions. Flat here moves the search to
+# the rs chunk-boundary phase and CamillaDSP's inter-stage holds, via the timestamp
+# side-channel (phase 2), not back to occupancy probes.
+#
+# ⚠ MECHANISM: pyalsaaudio exposes avail() but not delay(), and does not expose the
+# snd_pcm_t*. The handle lives at a fixed offset in the alsapcm C struct
+# (PyObject_HEAD, long pcmtype, int pcmmode, char *cardname, snd_pcm_t *handle —
+# offset 40 on a 64-bit build). The offset is PROBED AND VALIDATED, never assumed:
+# each candidate pointer is exercised in a forked child first, so a wrong guess can
+# only crash the child, never the transmitter. A validated offset is then reused for
+# re-extraction after a device reopen (same extension type, same struct layout).
+# If nothing validates, delay telemetry stays off and everything else is unchanged.
+
+_ASOUND        = None    # libasound handle, loaded once
+_HANDLE_OFFSET = None    # struct offset proven by the child probe, reused on reopen
+
+
+def _asound_lib():
+    """Load libasound once and bind the three calls used here."""
+    global _ASOUND
+    if _ASOUND is None:
+        path = ctypes.util.find_library("asound") or "libasound.so.2"
+        lib = ctypes.CDLL(path, use_errno=True)
+        lib.snd_pcm_state.restype  = ctypes.c_int
+        lib.snd_pcm_state.argtypes = [ctypes.c_void_p]
+        lib.snd_pcm_delay.restype  = ctypes.c_int
+        lib.snd_pcm_delay.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_long)]
+        _ASOUND = lib
+    return _ASOUND
+
+
+def _ptr_at(obj, offset):
+    """Read a pointer-sized field out of a CPython object at a raw byte offset."""
+    return ctypes.c_void_p.from_address(id(obj) + offset).value
+
+
+def _state_ok_in_child(lib, ptr):
+    """Call snd_pcm_state(ptr) in a forked child: a garbage pointer can only kill
+    the child. Exit 0 = the pointer answered with a legal PCM state (0..8).
+
+    ⚠ The wait is BOUNDED. fork() from a process with running threads (the NDI SDK
+    has its own) copies any lock mid-hold, so a child could in principle deadlock
+    inside libasound. A blocking waitpid would then hang the transmitter; instead
+    poll WNOHANG for up to 2 s, then SIGKILL the child and count the offset failed.
+    """
+    pid = os.fork()
+    if pid == 0:
+        try:
+            st = lib.snd_pcm_state(ctypes.c_void_p(ptr))
+            os._exit(0 if 0 <= st <= 8 else 1)
+        except BaseException:
+            os._exit(1)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+        time.sleep(0.01)
+    try:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+    return False
+
+
+def locate_pcm_handle(pcm):
+    """Return a validated ctypes.c_void_p to the pyalsaaudio object's snd_pcm_t*,
+    or None (telemetry off, transmitter unaffected). Call only on a STARTED stream —
+    the parent-side cross-check expects delay() to answer."""
+    global _HANDLE_OFFSET
+    if not DELAY_TELEMETRY:
+        return None
+    try:
+        lib = _asound_lib()
+    except OSError as exc:
+        logging.warning(f"delay: libasound unavailable ({exc}); delay telemetry off.")
+        return None
+    known = _HANDLE_OFFSET is not None
+    offsets = [_HANDLE_OFFSET] if known else [40, 32, 48, 24, 56, 64]
+    for off in offsets:
+        try:
+            ptr = _ptr_at(pcm, off)
+        except Exception:
+            continue
+        if not ptr or ptr % 8:
+            continue
+        if not known and not _state_ok_in_child(lib, ptr):
+            continue
+        # Parent-side cross-check on the (now child-proven, or previously proven)
+        # pointer: delay() must return 0 with a value inside +/- 1 s.
+        d = ctypes.c_long()
+        if (lib.snd_pcm_delay(ctypes.c_void_p(ptr), ctypes.byref(d)) == 0
+                and -SAMPLE_RATE <= d.value <= SAMPLE_RATE):
+            if not known:
+                logging.info(f"delay: snd_pcm_t* located at struct offset {off}; "
+                             f"first delay()={d.value}f.")
+            _HANDLE_OFFSET = off
+            return ctypes.c_void_p(ptr)
+    logging.warning("delay: no candidate offset validated; delay telemetry off, "
+                    "avail() telemetry unaffected.")
+    return None
+
+
 # ── Main transmitter loop ──────────────────────────────────────────────────────
 
 def run():
@@ -367,6 +488,8 @@ def run():
     pcm = open_alsa_capture()
     period_frames = granted_period(pcm)
     drain_capture_backlog(pcm, period_frames)
+    # The drain's reads have started the stream, so delay() can answer now.
+    delay_handle = locate_pcm_handle(pcm)
 
     # ── NDI audio frame (reused every period) ────────────────────────────────
     frame = NDIlib_audio_frame_v3_t()
@@ -399,6 +522,9 @@ def run():
     logging.info("NDI transmitter running.")
     consecutive_errors = 0
     avail_samples = []          # [tx window] telemetry, see the capture loop
+    delay_samples = []          # snd_pcm_delay() per period, same window
+    _delay_val    = ctypes.c_long()
+    delay_errs    = 0           # consecutive delay() failures; persistent -> disable
     frames_sent   = 0
     tele_t0       = time.monotonic()
     last_trim_t   = 0.0         # monotonic; 0 = never trimmed
@@ -422,6 +548,9 @@ def run():
                     # so the loopback has been filling unread for at least as long.
                     period_frames = granted_period(pcm)
                     drain_capture_backlog(pcm, period_frames)
+                    # New PCM object, new handle; the proven offset is reused.
+                    delay_handle = locate_pcm_handle(pcm)
+                    delay_errs = 0
                     consecutive_errors = 0
                 except RuntimeError as e:
                     logging.error(str(e))
@@ -475,6 +604,19 @@ def run():
                 avail_samples.append(pcm.avail())
             except Exception:
                 pass                       # never let telemetry kill the transmitter
+            # snd_pcm_delay() beside avail(): same instant, same cadence, so the two
+            # distributions decompose — delay minus avail is the graph-side component
+            # this reader's occupancy cannot see. Sampled AFTER the read, like avail.
+            if delay_handle is not None:
+                if _ASOUND.snd_pcm_delay(delay_handle, ctypes.byref(_delay_val)) == 0:
+                    delay_samples.append(_delay_val.value)
+                    delay_errs = 0
+                else:
+                    delay_errs += 1
+                    if delay_errs >= 1000:   # ~5 s of failures; something is wrong
+                        logging.warning("delay: read-out failing persistently; "
+                                        "disabling until the next (re)open.")
+                        delay_handle = None
             frames_sent += length
             now = time.monotonic()
             if now - tele_t0 >= TELEMETRY_S and avail_samples:
@@ -527,14 +669,30 @@ def run():
                 # the "did this window stall" witness; note it alternates 937/938 periods
                 # naturally (187.5 reads/s at 512f), so a 512f-short window is the 5 s
                 # boundary landing differently, NOT a missed deadline.
+                # ⚠ New keys are APPENDED (delayp10/50/90, dmax, dn) — every existing
+                # key keeps its name, order and format, per the parsing pitfall in the
+                # ledger. A window with no delay samples omits the delay keys entirely.
+                if delay_samples:
+                    ds = sorted(delay_samples)
+                    def _dq(p):
+                        return ds[min(len(ds) - 1, int(len(ds) * p))]
+                    delay_part = (
+                        f"delayp10/50/90={_dq(0.1)}/{_dq(0.5)}/{_dq(0.9)}f"
+                        f"({_dq(0.1)*ms:.1f}/{_dq(0.5)*ms:.1f}/{_dq(0.9)*ms:.1f}ms) "
+                        f"dmax={ds[-1]}f dn={len(ds)} "
+                    )
+                else:
+                    delay_part = ""
                 logging.info(
                     f"[tx window] availp10/50/90={_q(0.1)}/{_q(0.5)}/{_q(0.9)}f"
                     f"({_q(0.1)*ms:.1f}/{_q(0.5)*ms:.1f}/{_q(0.9)*ms:.1f}ms) "
                     f"max={s[-1]}f({s[-1]*ms:.1f}ms) n={len(s)} "
+                    f"{delay_part}"
                     f"sent={frames_sent}f({frames_sent*ms/1000.0:.2f}s) "
                     f"trim={trimmed}f wall={now - tele_t0:.2f}s"
                 )
                 avail_samples.clear()
+                delay_samples.clear()
                 frames_sent = 0
                 tele_t0 = now
 
