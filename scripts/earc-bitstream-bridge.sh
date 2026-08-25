@@ -146,8 +146,6 @@ TRIM=/opt/vibesbox-src/scripts/pcm_backlog_trim.py
 #     reorder here lands as wrong speakers in REAPER, looking like a routing bug.
 #     Re-verify after any change: per-channel RMS at dsp-in:monitor_1..6, channel 4
 #     (LFE) must show an order of magnitude less HF energy than the rest.
-#  3. ⛔ It CANNOT touch the ~230ms multichannel lipsync gap — Stage 14 placed that
-#     upstream of arecord. This buys ~22ms on DD+, nothing else.
 DECODER="${DECODER:-gst}"
 case "$FORMAT" in
     eac3) GST_PARSE=ac3parse; GST_DEC=avdec_eac3 ;;
