@@ -182,11 +182,15 @@ decode() {
             volume volume="$HEADROOM_LIN" ! \
             fdsink fd=1 sync=false
     fi
+    # -ar pins the rate the way the gst arm's caps do: AC-3 cores can legally be
+    # 44.1/32 kHz and DTS 44.1, and unpinned output would reach pcm_backlog_trim.py
+    # (whose time math assumes 48k) and pw-cat --raw --rate=48000 (pitch shift) at
+    # the stream's native rate. Both arms now guarantee 6ch/f32le/48k by construction.
     exec ffmpeg -hide_banner -nostats -loglevel warning -nostdin \
         -fflags nobuffer -flags low_delay -analyzeduration 100000 -probesize 32768 \
         -drc_scale 0 -f "$FORMAT" -i - \
         -af "volume=${HEADROOM_DB}dB" \
-        -ac 6 -c:a pcm_f32le -f f32le -
+        -ac 6 -ar 48000 -c:a pcm_f32le -f f32le -
 }
 
 echo "earc-bitstream-bridge: $IN_DEVICE S32_LE ${RATE} 2ch (IEC 61937 ${FORMAT^^}) -> decode 5.1 [$DECODER] -> 48k f32 -> source.tv.ardftsrc (PipeWire SRC -> 96k)"
@@ -289,6 +293,12 @@ fi
 # accidents with a small deterministic reservoir: clicks get 64 ms of slack, and any
 # start-up/stall backlog is cut back to 64 ms. Same idea as the Rust ardftsrc bridge's
 # stall trim, which is why the LPCM path never had the ~400 ms state.
+# ★ The 64 ms is TWO constraints, not two frames by accident: pw-cat below holds
+#   --latency=1536 (32 ms) of its own buffering, so the reservoir must exceed that,
+#   plus one atomic 32 ms decode lump of slack. Tried PRIME = 1 frame (32 ms)
+#   2026-08-25: pw-cat drank the whole reservoir every cycle — sustained ~62
+#   dry/re-prime cycles/s, each a forwarding gap. Reverted same day; zero dry-outs
+#   in all 64 ms history.
 arecord -D "$IN_DEVICE" -f S32_LE -r "$RATE" -c 2 -t raw \
         --buffer-time=40000 --period-time=5000 2>/dev/null \
   | python3 "$EXTRACT" "${EXTRACT_ARGS[@]}" \

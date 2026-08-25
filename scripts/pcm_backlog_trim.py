@@ -15,7 +15,8 @@ forever, with ERR 0 because the accidental reserve absorbs all jitter. Both
 states fail: acceptance is ERR 0 AND synced. The fix is a reservoir that is
 deliberate, small and deterministic:
 
-  PRIME  64 ms  (2 decode frames) held back before forwarding starts, and
+  PRIME  64 ms  (pw-cat's 32 ms target + 1 decode frame) held back before
+                forwarding starts, and
                 restored after any trim; absorbs the burst jitter that
                 causes the clicks. This is the path's one deliberate
                 latency add — bounded, documented, tunable.
@@ -69,7 +70,18 @@ import time
 
 FRAME = 6 * 4                       # 6ch f32
 RATE_BPS = 48000 * FRAME
-PRIME = int(0.064 * RATE_BPS) // FRAME * FRAME
+# Sized from the TWO constraints that bound it, not a ms literal:
+#   LOWER bound — pw-cat downstream runs --latency=1536 (32 ms) of ITS OWN buffering,
+#   and a reservoir no bigger than that target gets drunk whole every cycle:
+#   measured live 2026-08-25 with PRIME = 1 decode frame — a sustained ~62
+#   dry/re-prime cycles PER SECOND (each a forwarding gap), vs ZERO dry-outs across
+#   all previous 64 ms runs. The standing reserve must exceed pw-cat's target.
+#   UPPER contribution — one decode frame beyond it, because decode output arrives
+#   in atomic 32 ms lumps: one spare lump covers one late lump (the ERR cliff in
+#   earc-bitstream-bridge.sh's sweep sits BELOW one frame, not at it).
+DECODE_FRAME_SAMPLES = 1536         # AC-3/E-AC-3/DTS-core decode frame @48k
+PW_CAT_LATENCY_FRAMES = 1536        # MUST match EARC_PWCAT_LATENCY in earc-bitstream-bridge.sh
+PRIME = (PW_CAT_LATENCY_FRAMES + DECODE_FRAME_SAMPLES) * FRAME
 THRESH = int(0.192 * RATE_BPS) // FRAME * FRAME
 STAT_S = 10.0
 
