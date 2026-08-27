@@ -16,8 +16,8 @@ fetches each one from its own upstream, under its own licence.
 
 | Component | Role | Licence |
 |---|---|---|
-| [NDI SDK 6](https://ndi.video) (Vizrt NDI AB) | 6ch audio transport to the DSP unit | Proprietary SDK EULA — see below |
-| [CamillaDSP](https://github.com/HEnquist/camilladsp) | 6ch sum-bus processing | GPL-3.0 |
+| [NDI SDK 6](https://ndi.video) (Vizrt NDI AB) | 8ch audio transport to the DSP unit | Proprietary SDK EULA — see below |
+| [CamillaDSP](https://github.com/HEnquist/camilladsp) | 8ch sum-bus processing | GPL-3.0 |
 | [PipeWire](https://pipewire.org) / WirePlumber | audio graph, summing, drift correction | MIT |
 | [squeezelite](https://github.com/ralph-irving/squeezelite) | Lyrion/LMS player | GPL-3.0 |
 | [shairport-sync](https://github.com/mikebrady/shairport-sync) | AirPlay receiver | MIT |

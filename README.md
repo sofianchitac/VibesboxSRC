@@ -2,7 +2,7 @@
 
 A Raspberry Pi 5 audio hub that takes every source in the house — USB, Lyrion, AirPlay,
 Tidal, Bluetooth, and the TV over HDMI eARC — resamples each one to 96 kHz, sums them in a
-PipeWire graph, and sends a single 6-channel 96 kHz stream out over the network as NDI.
+PipeWire graph, and sends a single 8-channel 96 kHz stream out over the network as NDI.
 
 It is one half of a two-box home audio system. This box normalises; a second box does the
 DSP. It has been running as an appliance in a living room since 2026, not as a project that
@@ -32,15 +32,15 @@ design, not a workaround.
  ────────────────────────      ──────────     ──────────────     ───────────────    ──────────────
  USB Host (UAC2, 44.1–192k) ─┐
  Lyrion / Squeezelite        │
- AirPlay / shairport         ├─▶ ardftsrc ─▶  PipeWire sum  ─▶   CamillaDSP    ──▶  NDI 5.1 (6ch)
+ AirPlay / shairport         ├─▶ ardftsrc ─▶  PipeWire sum  ─▶   CamillaDSP    ──▶  NDI 5.1 (8ch)
  Tidal Connect               │   (→ 96 kHz)   (96 kHz; sums       (native PW;
- TV (eARC I2S tap)*          ┘                unmuted srcs)       6ch passthrough)
+ TV (eARC I2S tap)*          ┘                unmuted srcs)       8ch passthrough)
  Bluetooth (PW-native A2DP) ─────────────────▶      │
 
  source_router.py — activity detect · bridge lifecycle · PipeWire routing · per-source
  mute · Bluetooth mgmt · :8080 WebSocket ──▶ Touchscreen UI (800×480)
 
- * TV: LPCM up to 5.1 via ardftsrc (6ch), or IEC 61937 DD+/DD/DTS via the eARC decode bridge (6ch)
+ * TV: LPCM up to 7.1 via ardftsrc (8ch), or IEC 61937 DD+/DD/DTS via the eARC decode bridge (→ 5.1)
 ```
 
 Two things about that diagram are worth stating explicitly, because they surprise people:

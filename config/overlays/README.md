@@ -172,26 +172,23 @@ sending device's own channel configuration determines it. Recorded as a
 measurement only: **channel mapping is not corrected on the Pi, REAPER handles
 it** (same contract as the USB source).
 
-`ardftsrc-bridge@tv` opens **6ch** as of 2026-08-12 (was 2ch = SD0 only), so
-multichannel LPCM now reaches the sum bus. Always 6ch with no channel-count
-detection — a 2.0 source leaves the unused lanes digitally silent, so stereo
-simply sits in FL/FR.
+`ardftsrc-bridge@tv` opens **8ch** as of 2026-08-13 (2ch = SD0 only before
+2026-08-12, then 6ch for a day), so multichannel LPCM reaches the sum bus intact.
+Always 8ch with no channel-count detection — a narrower source leaves the unused
+lanes digitally silent, so stereo simply sits in FL/FR.
 
-★ **The tap does 8ch; we deliberately take 6.** All four lanes were verified
-carrying discrete audio, so 7.1 genuinely arrives at `hw:eARC,0` — the 6-channel
-limit is entirely **downstream**, in three places at once:
+★ **The whole chain is 8ch wide, end to end.** The 6-wide read it replaced was not
+merely lossy in theory: this source puts the LPCM surrounds on **lanes 7–8 (SD3)**
+while lanes 5–6 sit silent, so a 6ch open discarded exactly the surround pair.
 
 | Stage | Width |
 |---|---|
-| `camilladsp/dsp_6ch.yml` | capture 6 / playback 6 |
+| `camilladsp/dsp_8ch.yml` | capture 8 / playback 8 |
 | `ndi_transmitter.py` (reads PipeWire directly) | 8ch |
-| NDI stream identity | `VibesboxSRC-5.1` |
+| NDI stream identity | `VibesboxSRC-5.1` (historical name; the stream is 8ch) |
 
-So a 7.1 source loses the pair on lane SD3, and that is a choice, not a hardware
-ceiling. Going to 8 would mean changing the CamillaDSP config, the loopback width,
-the transmitter, the stream name and REAPER's input — a system-wide change, not a
-one-line edit in the bridge. Nothing today needs it: the whole chain is 5.1 and
-REAPER's Penteo 360 owns the upmix.
+`dsp_6ch.yml` is still in the tree for rollback but is not what `source_router`
+pushes. Channel order is passed through as captured — REAPER owns all mapping.
 
 ### Rate-following, 2026-08-12 — the TV no longer has to be pinned to 48 kHz
 
