@@ -33,7 +33,7 @@
 
 use std::fs;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1068,6 +1068,15 @@ fn main() {
     // low-time accumulator above the early-continue needs it before that binding exists.
     let keep_elems = TRIM_UNIT as usize * channels;
     let mut last_diag = Instant::now();
+    // MEASURED resampler occupancy (2026-08-28). `rs~` above it is `group_ms`, a CONSTANT derived
+    // once from prim_samples/rate — so `sum~` cannot show movement originating in the resampler,
+    // which is exactly the term the ledger records as a +/-17 ms sawtooth standing behind a fixed
+    // number. There is no occupancy API on RealtimeResampler, so derive it by conservation:
+    // everything written in, minus everything read out, minus what is sitting ready, is what the
+    // transform still holds. Counters are samples (interleaved), input at `rate`, output at
+    // TARGET_RATE. Atomics only to keep the `diag` closure's immutable borrow legal.
+    let rs_in_samples = AtomicU64::new(0);
+    let rs_out_samples = AtomicU64::new(0);
     let diag = |tag: &str, cap_f: i64, ring_samples: usize, ready_samples: usize, out_f64: i64,
                 floor_samples: usize, low_frac: f64| {
         let cap_ms = cap_f as f64 * 1000.0 / rate as f64;
@@ -1085,12 +1094,22 @@ fn main() {
         // Share of the window so far spent with the ring below one capture period. The trim
         // acts on this, not on the floor — see LOW_FRAC_MAX.
         let low_pct = low_frac * 100.0;
+        // Input samples -> their output-rate equivalent, minus what has left, minus what is ready.
+        // Signed on purpose: a persistently negative value would falsify the conservation model
+        // rather than hide behind a clamp.
+        let rs_held_samples = rs_in_samples.load(Ordering::Relaxed) as f64
+            * (TARGET_RATE as f64 / rate as f64)
+            - rs_out_samples.load(Ordering::Relaxed) as f64
+            - ready_samples as f64;
+        let rsm_ms = rs_held_samples / channels as f64 * 1000.0 / TARGET_RATE as f64;
         eprintln!(
             "ardftsrc-bridge[diag {tag}]: cap={cap_f}f({cap_ms:.1}ms) readq={rq_n}f({rq_ms:.1}ms,blocked {rq_us}us) \
              ring={ring_frames}f({ring_ms:.1}ms) \
              floor={floor_frames}f low={low_pct:.0}% \
-             rs~{group_ms:.1}ms ready={ready_frames}f({ready_ms:.1}ms) out={out_f64}f({out_ms:.1}ms) sum~{:.1}ms",
-            cap_ms + rq_ms / 2.0 + ring_ms + group_ms + ready_ms + out_ms
+             rs~{group_ms:.1}ms rsm~{rsm_ms:.1}ms ready={ready_frames}f({ready_ms:.1}ms) out={out_f64}f({out_ms:.1}ms) \
+             sum~{:.1}ms summ~{:.1}ms",
+            cap_ms + rq_ms / 2.0 + ring_ms + group_ms + ready_ms + out_ms,
+            cap_ms + rq_ms / 2.0 + ring_ms + rsm_ms + ready_ms + out_ms
         );
     };
 
@@ -1354,6 +1373,7 @@ fn main() {
         if take > 0 {
             let n = cons.pop_slice(&mut in_buf[..take]);
             if n > 0 {
+                rs_in_samples.fetch_add(n as u64, Ordering::Relaxed);
                 if let Err(e) = rs.write_samples(&in_buf[..n]) {
                     eprintln!("ardftsrc-bridge: write_samples failed: {e:?}");
                     running.store(false, Ordering::SeqCst);
@@ -1414,6 +1434,7 @@ fn main() {
                 break 'process;
             }
         };
+        rs_out_samples.fetch_add(w as u64, Ordering::Relaxed);
         if w == 0 {
             thread::sleep(Duration::from_micros(500));
             continue 'process;
@@ -1520,6 +1541,10 @@ fn main() {
             //    `samples_pending_output`, so the whole resampler is rebuilt. This discards
             //    its priming, which costs one chunk (~39 ms @48k) of audio at the reset —
             //    on a path that is already discontinuous at start-up.
+            // The rebuild discards the resampler's contents, so the conservation counters have to
+            // go with it — otherwise every subsequent `rsm~` is offset by the priming just dropped.
+            rs_in_samples.store(0, Ordering::Relaxed);
+            rs_out_samples.store(0, Ordering::Relaxed);
             rs = match RealtimeResampler::<f64>::new(make_config()) {
                 Ok(r) => r,
                 Err(e) => {
