@@ -52,6 +52,35 @@ real: a few small splices in the first seconds after a format change (when
 the stream is already discontinuous) against a permanent ~75 ms of lipsync
 error. Set SETTLE_S = 0 to disable and get the old ceiling-only behaviour.
 
+★ 2026-08-28: SETTLE fixed the BIMODALITY but left the LANDING a lottery. `settled`
+is latched by a 5 s TIMER, which samples the FIFO at whatever phase the timer
+fires; below THRESH nothing regulates, so whatever it lands on free-integrates
+there forever. Over 40 live instances the landing is QUANTIZED on a 512-frame
+(10.67 ms = 2 graph quanta) lattice — 14.2 / 35.6 / 46.2 / 56.9 / 67.6 / 78.2 —
+spanning 67.6 ms, and the steady trough follows it monotonically (0.0 / 10.7 /
+32.0 / 49.8 / 60.5). That is ~45 ms of lipsync drawn fresh at every bridge start:
+two filmed AC-3 takes 70 s apart measured -60 and -105 ms purely by landing on
+78.2 vs 14.2.
+
+The regulated quantity is now the FIFO's TROUGH (p10 over a window), not its
+instantaneous depth. The trough is the STANDING backlog — the part no consumer
+ever takes — so it is 1:1 the latency and shedding it can never starve pw-cat.
+Peaks are in-flight lumps and must NOT be trimmed: gate on p10, never on max
+(the NDI transmitter's regulators learned the same lesson).
+
+⚠ TROUGH and FILL are different quantities, one in-flight lump apart, and
+conflating them is a live bug not a nicety. The 2026-08-25 constraint above is on
+PRIME, a FILL level; the safe TROUGH floor is correspondingly lower, and the field
+proves it — landing 46.2 ms leaves a 32.0 ms trough and ran 23 instances with no
+dry-outs. Only trough 10.7 ms actually misbehaved (2 dry-outs/instance).
+
+⚠ This trims DOWNWARD only, by design. Raising a standing level means withholding
+output, i.e. a gap, and an unguarded re-prime starves pw-cat into drinking the
+refill greedily — one re-prime begets the next, which is the 2026-08-25
+dry/re-prime oscillation. Trim-only reaches 38 of the 40 live landings; the 2
+that land BELOW setpoint keep the old behaviour rather than buy 5 % with a
+mechanism that can oscillate.
+
 ⚠ The PRIME that "disappears" on the fast branch (steady floor ~7 ms) has
 moved DOWNSTREAM into pw-cat's own buffers, not vanished — that seeding is
 what the prime is for. Do not read a low floor as erosion.
@@ -96,6 +125,21 @@ def pipe_capacity(fd, default=4096):
     except (AttributeError, OSError):
         return default          # no F_GETPIPE_SZ (non-Linux): assume the bridge's setting
 SETTLE_S = 5.0                      # 0 disables the regulator (ceiling-only, pre-2026-08-01)
+LUMP = DECODE_FRAME_SAMPLES * FRAME     # in-flight granularity; also the trim unit
+# The graph is pinned to quantum 512 @ 96k, so this 48k node exchanges 256 frames per
+# 5.333 ms cycle. TWO of those is 512 frames = 10.67 ms — exactly the lattice the live
+# landings fall on, so it is the natural convergence band: tighter chatters on
+# single-quantum jitter, wider re-admits the spread this exists to remove.
+GRAPH_QUANTUM = 256
+BAND = 2 * GRAPH_QUANTUM * FRAME
+# TROUGH setpoint (not a fill level — see the docstring). pw-cat's own buffering target
+# is both the derived floor and, independently, the field's most common operating point:
+# 23 of 40 live instances sat here with a clean dry-out record.
+TARGET = PW_CAT_LATENCY_FRAMES * FRAME
+WINDOW_S = 0.5                          # trough measurement window
+CONVERGE_WINDOWS = 2                    # consecutive in-band windows before latching
+# Bound on convergence. Past this, latch wherever we are rather than keep splicing.
+STARTUP_MAX_S = 15.0
 # Trimming to exactly PRIME fires on every few-ms overshoot: offline that was 98 splices in
 # the first second, i.e. a burst of crackle where there had been one skip. One decode frame
 # of slack cuts that to a handful and still bounds the settle-window depth at PRIME+32ms,
@@ -107,6 +151,16 @@ def ms(nbytes):
     return nbytes / RATE_BPS * 1000
 
 
+def p10(samples):
+    """Nearest-rank 10th percentile — the window's TROUGH.
+
+    Not min(): one transient empty loop iteration would set min for a whole window and
+    provoke a trim the standing level never justified. Not mean or max either — those
+    include the in-flight lumps, and trimming those is exactly what starves pw-cat."""
+    q = sorted(samples)
+    return q[max(0, (len(q) * 10 + 99) // 100 - 1)]
+
+
 def main():
     fifo = bytearray()
     eof = False
@@ -115,8 +169,11 @@ def main():
     settled = False
     written = 0
     startup_dropped = 0
-    lo = hi = 0
-    t_stat = time.monotonic()
+    depths = []                     # FIFO depth samples for the current window
+    trough = 0                      # last measured p10
+    in_band = 0                     # consecutive windows with the trough at setpoint
+    lo = hi = 0                     # re-seeded once the consumer is proven draining
+    t_win = t_stat = time.monotonic()
     os.set_blocking(0, False)
     os.set_blocking(1, False)
     while not (eof and not fifo):
@@ -148,6 +205,11 @@ def main():
             written += n
             if flowing is None and written > 2 * pipe_capacity(1):
                 flowing = time.monotonic()
+                # Start the trough window and the min/max stats HERE. Before this the
+                # FIFO is legitimately empty (priming), and folding those samples in is
+                # what made every instance's first stat line read "min 0.0".
+                depths, t_win = [], flowing
+                lo = hi = len(fifo)
                 print(f"pcm-trim: consumer draining; {ms(startup_dropped):.1f}ms "
                       f"discarded so far, regulating for {SETTLE_S:.0f}s",
                       file=sys.stderr, flush=True)
@@ -164,21 +226,52 @@ def main():
             # Start-up window: hold AT the reservoir, not merely under the ceiling —
             # whatever is above PRIME here is conserved race/upstream backlog, and if it
             # is not shed now it becomes permanent latency (nothing downstream sheds it).
+            # Instantaneous, because that backlog is ~600 ms and must go NOW, before any
+            # measurement window could have elapsed.
             drop = (len(fifo) - PRIME) // FRAME * FRAME
             del fifo[:drop]
             startup_dropped += drop
-        elif not settling and not settled:
-            settled = True
-            print(f"pcm-trim: settled at {ms(len(fifo)):.1f}ms reservoir "
-                  f"({ms(startup_dropped):.1f}ms discarded in total)",
-                  file=sys.stderr, flush=True)
+
+        # ── trough regulator ──────────────────────────────────────────────────
+        # Acts on the FIFO's p10, so it only ever moves the STANDING level, and only
+        # downward. The latch is a MEASURED CONVERGENCE, not a timer — the timer is what
+        # made the landing a lottery in the first place.
+        depths.append(len(fifo))
+        now = time.monotonic()
+        if flowing is not None and now - t_win >= WINDOW_S and depths:
+            trough = p10(depths)
+            depths = []
+            t_win = now
+            # Pre-latch the band is tight (BAND); after the latch it widens to one
+            # in-flight lump, so ordinary jitter is never spliced during listening —
+            # only 1 of 54 live steady-state windows would have crossed that threshold.
+            slack = BAND if not settled else LUMP
+            if trough > TARGET + slack:
+                drop = min((trough - TARGET) // FRAME * FRAME, len(fifo))
+                del fifo[:drop]
+                startup_dropped += drop
+                in_band = 0
+                print(f"pcm-trim: trough {ms(trough):.1f}ms over setpoint "
+                      f"{ms(TARGET):.1f} — shed {ms(drop):.1f}ms of standing backlog",
+                      file=sys.stderr, flush=True)
+            else:
+                in_band += 1
+            if not settled and (in_band >= CONVERGE_WINDOWS or
+                                now - flowing > STARTUP_MAX_S):
+                settled = True
+                # Keep `settled at <instantaneous depth>` verbatim: 40 instances of
+                # journal history are keyed on that number. The trough is what the
+                # regulator actually holds, so report it alongside, not instead.
+                print(f"pcm-trim: settled at {ms(len(fifo)):.1f}ms reservoir "
+                      f"({ms(startup_dropped):.1f}ms discarded in total), "
+                      f"trough {ms(trough):.1f}ms",
+                      file=sys.stderr, flush=True)
         if len(fifo) > THRESH:
             drop = (len(fifo) - PRIME) // FRAME * FRAME
             del fifo[:drop]
             print(f"pcm-trim: dropped {drop // FRAME}f ({ms(drop):.1f}ms) "
                   f"of backlog", file=sys.stderr, flush=True)
         lo, hi = min(lo, len(fifo)), max(hi, len(fifo))
-        now = time.monotonic()
         if now - t_stat >= STAT_S:
             print(f"pcm-trim: fifo {ms(len(fifo)):.1f}ms "
                   f"(min {ms(lo):.1f} max {ms(hi):.1f} over {now - t_stat:.0f}s)",
