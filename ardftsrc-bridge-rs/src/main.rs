@@ -195,12 +195,18 @@ const READY_HIST_BUCKETS: usize = 96; // 0..12288 frames (128 ms) — ~2x the wi
 // resampler FIFO (~4100 f, NO shed path, ~1 h). Same defect, 4x the amplitude, where no trim can
 // reach it.
 //
-// ⛔⛔ MEASURED ON @usb AND @lyrion ONLY — NOT established as the filmed variance, which is
-// entirely @tv. §4 puts eARC at -27.39 ppm, the OPPOSITE SIGN to USB's +11.53, under which this
-// FIFO DRAINS (~2.6 f/s) and this regulator — silent below setpoint, downward only — never fires
-// on @tv at all. §5's 105-min eARC segment (p10 = 64 f in 100% of 413 windows, no trend, 0 trims)
-// is CONTRARY evidence, not missing evidence. The open question is one >=60-min @tv soak reading
-// `readyp10`; an A/B cannot answer it, because per-run restarts are what hid this for eight weeks.
+// ⛔⛔ THIS IS A @usb / @lyrion FAULT. IT IS **NOT** THE FILMED LPCM VARIANCE, WHICH IS ALL @tv.
+// §4 puts eARC at -27.39 ppm, the OPPOSITE SIGN to USB's +11.53. Tested directly — 27-min single
+// @tv instance, 2026-08-29, no restart: `readyp10` FALLS 832 -> 64 f and pins at the bottom bucket
+// for the final 18 min; 0 regulator actions, 0 underruns, 0 xruns. This regulator is therefore
+// correctly and permanently INERT on @tv, which never rises above setpoint.
+//
+// ⇒ DIRECTION ALONE decides which symptom you get, and it dissolves §5's "an adaptation exists":
+// over-production has nowhere to go downstream (PipeWire will not consume faster than the graph
+// rate) so it backs up into `ready` = a ratchet; under-production just drains buffers to empty and
+// pins = no ratchet. Same absent regulation, opposite sign. ⛔ Do not "fix" the @tv floor by making
+// this regulator bidirectional — raising a standing level means withholding output, and §7.9's
+// dry/re-prime oscillation is what that costs.
 //
 // ⛔ WHY EIGHT WEEKS OF INSTRUMENTS MISSED IT — read before trusting any older number here.
 // Not for want of an instrument: `ready_hist` has been printing since 2026-08-20. Three reasons,
