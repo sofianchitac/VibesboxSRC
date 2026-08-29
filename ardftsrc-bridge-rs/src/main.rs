@@ -201,12 +201,17 @@ const READY_HIST_BUCKETS: usize = 96; // 0..12288 frames (128 ms) — ~2x the wi
 // for the final 18 min; 0 regulator actions, 0 underruns, 0 xruns. This regulator is therefore
 // correctly and permanently INERT on @tv, which never rises above setpoint.
 //
-// ⇒ DIRECTION ALONE decides which symptom you get, and it dissolves §5's "an adaptation exists":
-// over-production has nowhere to go downstream (PipeWire will not consume faster than the graph
-// rate) so it backs up into `ready` = a ratchet; under-production just drains buffers to empty and
-// pins = no ratchet. Same absent regulation, opposite sign. ⛔ Do not "fix" the @tv floor by making
-// this regulator bidirectional — raising a standing level means withholding output, and §7.9's
-// dry/re-prime oscillation is what that costs.
+// ⇒ DIRECTION ALONE decides which symptom you get: over-production has nowhere to go downstream
+// (PipeWire will not consume faster than the graph rate) so it backs up into `ready` = a ratchet;
+// under-production just drains buffers to empty and pins = no ratchet. Same absent regulation,
+// opposite sign. ⛔ Do not "fix" the @tv floor by making this regulator bidirectional — raising a
+// standing level means withholding output, and §7.9's dry/re-prime oscillation is what that costs.
+//
+// ⛔⛔ THE @tv SOAK IS A STATEMENT ABOUT THIS FIFO, NOT ABOUT @tv LATENCY. Do not repeat the slide
+// I made from one to the other. The filmed number is END-TO-END, and re-measured 2026-08-29 the
+// within-clip PCM drift goes BOTH WAYS (4 takes up, 4 down, 1 flat; the two long takes disagree,
+// +5.8 vs -0.4 ms/min). Over the same 90 min this FIFO was pinned and the NDI transmitter was flat
+// (avail 0/0/0f, trim=0f), so the filmed drift is downstream of the Pi. See docs/HANDOFF.md.
 //
 // ⛔ WHY EIGHT WEEKS OF INSTRUMENTS MISSED IT — read before trusting any older number here.
 // Not for want of an instrument: `ready_hist` has been printing since 2026-08-20. Three reasons,
