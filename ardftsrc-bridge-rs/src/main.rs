@@ -20,11 +20,12 @@
 // thread — that decoupling is what lets the 6ch USB gadget run a large FFT block without
 // capture overruns (the v2 single-threaded ffmpeg filter graph could not). The blocking
 // writei into the "pipewire" PCM hard-locks output delivery to the 96k graph clock, so
-// source-vs-graph clock drift accumulates IN THE RING (just as v2's drift accumulated in
-// ffmpeg's 131072-frame capture buffer and produced the accepted "occasional flush"). The
-// ring is therefore the drift reservoir as well as the compute-burst buffer: its size sets
-// the flush interval under drift — smaller = lower latency but more frequent brief flushes.
-// The soak test must confirm that flush rate is inaudible-enough.
+// source-vs-graph clock drift has to accumulate SOMEWHERE (just as v2's drift accumulated in
+// ffmpeg's 131072-frame capture buffer and produced the accepted "occasional flush").
+//
+// ⚠ It is no longer the ring. Since the ingest high-water gate, the drift reservoir is the
+// RESAMPLER'S OUTPUT FIFO — see READY_BAND for the measurement, and for why every ring-side
+// trim below is blind to it. The ring is now only the compute-burst buffer.
 //
 // 2026-06-10: moved from the InterleavedResampler chunk API to RealtimeResampler
 // (push/pull, priming introspection) + PRESET_GOOD, and added a sustained-backlog
@@ -171,6 +172,75 @@ const RING_HIST_BUCKETS: usize = 48;  // 0..6144 frames; the last bucket is an o
 // for. If the gate ceiling ever rises, raise this with it.
 const READY_HIST_UNIT: usize = 128;   // 1.3 ms @96k
 const READY_HIST_BUCKETS: usize = 96; // 0..12288 frames (128 ms) — ~2x the widest gate ceiling
+
+// ── The drift regulator (2026-08-29). The instrument above finally FEEDS a decision. ──
+//
+// ★ MEASURED, live, two sources: `readyp10` — the resampler FIFO's TROUGH, i.e. the part no write
+// ever takes, i.e. 1:1 standing latency — climbs MONOTONICALLY from bridge start.
+//     @usb    1088f (11.3 ms) -> 3904f (40.7 ms) over 42 min   = 11.6 ppm
+//     @lyrion 2944f           -> 4672f           over 40 min   =  7.5 ppm
+// Ledger §4 measured the USB clock at +11.53 ppm independently, a year of sessions ago. Same
+// number. Drift is UNCORRECTED here: the source delivers (1+e)x realtime, PipeWire consumes at the
+// graph rate, and the surplus has to pool somewhere.
+//
+// ⇒ THIS IS NOT A NEW PHENOMENON. It is ledger §5's limit cycle, RELOCATED. §5 documents the same
+// cycle in the RING — `deadband-deep` every ~15 min, 1024 f a time, "end-to-end latency sawtooths
+// 10.7 ms with a ~15 min period", and concludes "✅ Inaudible — the variance is the defect, not
+// the skip." Since the ingest high-water gate the gate is a CEILING ON `ready`, so `ready` fills
+// FIRST — from the ~11 ms the race reset lands on up to `ingest_high_water` (~5112f = 53 ms at
+// 44.1k) — and only then does the surplus spill into the ring. Watched that spill begin live at
+// 13:30 (`ring_md` 0 -> 585) exactly where the arithmetic put it. Same session: 42 min, ZERO
+// trims, `deep=0.0%` every window, ring p50 flat 576-960, against §5's 3.69 trims/h and a ring p50
+// ramping 1344 -> 1856. ⇒ The reservoir moved from the ring (1024 f, trimmable, 15 min) to the
+// resampler FIFO (~4100 f, NO shed path, ~1 h). Same defect, 4x the amplitude, where no trim can
+// reach it.
+//
+// ⛔⛔ MEASURED ON @usb AND @lyrion ONLY — NOT established as the filmed variance, which is
+// entirely @tv. §4 puts eARC at -27.39 ppm, the OPPOSITE SIGN to USB's +11.53, under which this
+// FIFO DRAINS (~2.6 f/s) and this regulator — silent below setpoint, downward only — never fires
+// on @tv at all. §5's 105-min eARC segment (p10 = 64 f in 100% of 413 windows, no trend, 0 trims)
+// is CONTRARY evidence, not missing evidence. The open question is one >=60-min @tv soak reading
+// `readyp10`; an A/B cannot answer it, because per-run restarts are what hid this for eight weeks.
+//
+// ⛔ WHY EIGHT WEEKS OF INSTRUMENTS MISSED IT — read before trusting any older number here.
+// Not for want of an instrument: `ready_hist` has been printing since 2026-08-20. Three reasons,
+// each of which is a live trap for the next measurement too:
+//   1. EVERY A/B IN THE PROGRAMME RESTARTS THE BRIDGE PER RUN (see `ingest_high_water` below; §7
+//      "the probe starts a fresh @lyrion per run"). A restart zeroes the pedestal, so all 24
+//      output-cadence runs, all 44 landing-lottery runs and every ppm probe were sampled in the
+//      first minutes of an instance — at the BOTTOM of the cycle, by construction. The one round
+//      that could not reset (filmed takes an hour apart on live instances) is precisely where the
+//      unexplained 26-44 ms turned up.
+//   2. §5b's "there is no excess to trim — the bridge is at its structural floor" read `readyp90`
+//      on a FRESH instance. It is a true statement about the sawtooth's AMPLITUDE (one DFT block;
+//      still true today, p90-p10 = 3584 f at both ends of the run) and says nothing about the
+//      PEDESTAL it rides on. Amplitude and pedestal are different quantities — the same mistake in
+//      kind as TROUGH vs FILL in `pcm_backlog_trim.py`.
+//   3. §4's "drift is not what costs the latency — 27 ppm cannot require 28 ms of buffer" is true
+//      of a REGULATED buffer and assumes a servo exists everywhere. Unregulated, 11.6 ppm is
+//      42 ms/hour. §5 had already logged the residue this leaves — "the ring fills 2.3x faster
+//      than its clock allows … a second accumulation source exists and is unidentified."
+//
+// ⛔ `summ~` CANNOT corroborate any of this and must not be quoted at it: `rsm~` carries
+// `-ready` and `ready_ms` carries `+ready`, so `ready` cancels EXACTLY out of the sum. What is
+// left of it grows with any error in the NOMINAL input rate (11.6 ppm x 2520 s = 29 ms, against
+// the 25.7 ms "rise" observed) — the same class of artifact as the withdrawn +533 ppm servo
+// finding. `num_samples_ready()` is a direct occupancy query and stands alone.
+//
+// ⚠ THIS REGULATOR DOES NOT LATCH, and that is the one way it differs from its template.
+// `pcm_backlog_trim.py` sheds a one-time START-UP backlog, proves convergence, then sets
+// `settled` and widens its band precisely so ordinary jitter is never spliced during listening.
+// Drift is PERMANENT, so there is no converged state to latch: this sheds ~1.1 f/s for the life
+// of the instance. The cadence is therefore an audibility choice, not a free one. Chosen with the
+// user 2026-08-29: the TIGHTEST band the instrument can resolve — one histogram bucket — so each
+// splice is ~1.3 ms and the standing level is held inside 1.3 ms instead of roaming 42.
+const READY_BAND: usize = READY_HIST_UNIT;   // 128 f = 1.33 ms @96k; ~2 min/splice at 11.6 ppm
+// Setpoint for the TROUGH, derived from the CONSUMER's granularity exactly as the bitstream
+// regulator's `TARGET` is (pw-cat's own buffering target there; the writei loop's period here):
+// one output period guarantees every write can be a whole period without the FIFO ever being the
+// binding constraint. It is a TROUGH, not a fill — the FIFO still swings a whole DFT block above
+// it — and conflating the two is the live bug §7.9 cost a run to. Bound at runtime to
+// `out_period_frames`, so it tracks OUT_PERIOD rather than restating it as a literal.
 const CAP_BUFFER: i64 = 4096;
 // ⚠ `OUT_PERIOD` is not a latency term. The blocking `writei` keeps the output PCM near
 // full, so standing latency tracks OUT_BUFFER, not the write granularity. Its only leverage
@@ -268,6 +338,23 @@ fn ring_pct(hist: &[Duration], unit: usize, q: f64) -> usize {
 /// block is exactly the ring depth the loop exists to remove (ledger section 5b).
 fn out_chunk_frames(avail_frames: usize, period_frames: usize, ready_frames: usize) -> usize {
     avail_frames.min(period_frames).min(ready_frames)
+}
+
+/// Output frames the drift regulator should shed, given the window's measured trough.
+///
+/// Downward only, and zero inside the band — raising a standing level means withholding output,
+/// i.e. a gap, and an unguarded re-prime is the 2026-08-25 dry/re-prime oscillation.
+///
+/// ⚠ `trough` arrives QUANTIZED to `ring_pct`'s bucket midpoints, and that quantization is what
+/// supplies the hysteresis: with the band at one bucket, shedding `trough - target` lands the next
+/// window's p10 one bucket BELOW the trigger, so a regulated instance alternates trim/no-trim
+/// rather than trimming every window. Widening the band without re-checking that interaction is
+/// how this turns into a per-window splicer.
+fn drift_drop_frames(trough: usize, target: usize, band: usize, ready_now: usize) -> usize {
+    if trough <= target + band {
+        return 0;
+    }
+    (trough - target).min(ready_now)
 }
 
 /// Snap a measured frame rate onto a standard rate. None when it is not within
@@ -1001,6 +1088,8 @@ fn main() {
     // for the odd pass in steady state that is the CORRECT outcome, not a defect — the excess lands
     // in the ring, which is the one place the trims can reach.
     let ingest_high_water = block_out_frames + INGEST_SLACK;
+    // Setpoint for the drift regulator's TROUGH, in OUTPUT frames. See READY_BAND.
+    let ready_target = out_period_frames;
     let t_start = Instant::now();
     // ── Phase-2 latency side-channel (stamp.rs) ──────────────────────────────
     // Publishes (cumulative out_frames, CLOCK_MONOTONIC completion time) per output
@@ -1309,6 +1398,52 @@ fn main() {
                     floor_armed = false;
                 }
             }
+
+            // ── THE DRIFT REGULATOR. Holds the resampler FIFO's TROUGH at one output period. ──
+            // See READY_BAND for the measurement and for why the ring trims above cannot do this
+            // job: they watch a compartment the drift no longer reaches.
+            //
+            // Acts on `rdy10`, so it only ever moves the STANDING level. The peaks are the DFT
+            // block in flight and trimming those would starve the writei loop — the same p10-never-
+            // max rule the bitstream regulator and the NDI transmitter's regulators both landed on.
+            //
+            // ⚠ Deliberately NOT gated on `!trim_to_keep`'s outcome the way the block it sits in
+            // is: it is an independent fault in an independent compartment. But it does sit INSIDE
+            // that block, so a window that fires a ring trim skips this one — never double-splice
+            // two faults in one window.
+            // The trough is a WINDOW statistic and this fires at one instant on the sawtooth,
+            // which may be below it — hence the cap at what is actually there.
+            let drift_drop = drift_drop_frames(
+                rdy10, ready_target, READY_BAND, rs.num_samples_ready() / channels);
+            if race_reset_done && drift_drop > 0 {
+                // Whole frames only — a partial frame rotates the channel mapping, exactly as on
+                // the ring's drop path.
+                let mut left = drift_drop * channels;
+                let mut dropped = 0usize;
+                // `out_f` is dead between the window close and the write below, so it doubles as
+                // the discard buffer rather than carrying a second 200 kB allocation for life.
+                while left > 0 {
+                    match rs.read_samples(&mut out_f[..left.min(out_cap)]) {
+                        Some(0) | None => break,
+                        Some(n) => {
+                            dropped += n;
+                            left -= n.min(left);
+                        }
+                    }
+                }
+                // Conservation: `rsm~` is derived from in-minus-out, so a discard that skips this
+                // counter shows up forever after as phantom occupancy inside the transform.
+                rs_out_samples.fetch_add(dropped as u64, Ordering::Relaxed);
+                eprintln!(
+                    "ardftsrc-bridge[diag drift]: ready trough {rdy10}f({:.1}ms) over setpoint \
+                     {ready_target}f({:.1}ms) — shed {}f({:.1}ms) of standing drift",
+                    o2ms(rdy10),
+                    o2ms(ready_target),
+                    dropped / channels,
+                    o2ms(dropped / channels),
+                );
+            }
+
             floor_min = usize::MAX;
             depth_hist = [Duration::ZERO; DEPTH_BUCKETS + 1];
             ring_hist = [Duration::ZERO; RING_HIST_BUCKETS + 1];
@@ -1492,8 +1627,12 @@ fn main() {
         if wrote_any && !first_write_done {
             first_write_done = true;
             eprintln!(
-                "ardftsrc-bridge[diag startup]: first block written at +{:.0}ms after exec",
-                t_start.elapsed().as_secs_f64() * 1000.0
+                "ardftsrc-bridge[diag startup]: first block written at +{:.0}ms after exec; \
+                 block={block_out_frames}f gate={ingest_high_water}f({:.1}ms) \
+                 drift setpoint={ready_target}f({:.1}ms) band={READY_BAND}f",
+                t_start.elapsed().as_secs_f64() * 1000.0,
+                ingest_high_water as f64 * 1000.0 / TARGET_RATE as f64,
+                ready_target as f64 * 1000.0 / TARGET_RATE as f64,
             );
             diag(
                 "startup",
@@ -1631,6 +1770,50 @@ mod tests {
         assert!((1792..1792 + RING_HIST_UNIT).contains(&p50), "p50 was {p50}");
         // …while the trim's own bucketing rounds it down to 1 whole TRIM_UNIT, i.e. "not deep".
         assert_eq!(1792 / TRIM_UNIT as usize, 1);
+    }
+
+    /// The regulator must be silent in the band. A per-window splicer is the failure mode that
+    /// makes this unshippable on an appliance someone is listening to.
+    #[test]
+    fn drift_regulator_is_silent_inside_the_band() {
+        let (target, band) = (1024, READY_BAND);
+        for trough in [0, 64, 192, 1024, 1088, 1152] {
+            assert_eq!(drift_drop_frames(trough, target, band, 8192), 0, "trough {trough}");
+        }
+    }
+
+    /// Downward only — a trough BELOW setpoint must never provoke a re-prime. `pcm_backlog_trim`
+    /// learned this the expensive way (the 2026-08-25 dry/re-prime oscillation).
+    #[test]
+    fn drift_regulator_never_raises() {
+        assert_eq!(drift_drop_frames(64, 1024, READY_BAND, 8192), 0);
+    }
+
+    /// The quantization IS the hysteresis: `ring_pct` reports bucket midpoints, so the first
+    /// trough that can trigger is one bucket above the band, and shedding `trough - target` lands
+    /// the next window's p10 back inside it. Without this the regulator fires every window.
+    #[test]
+    fn drift_regulator_lands_back_inside_the_band() {
+        let (target, band) = (1024, READY_BAND); // band = 128 f = one READY_HIST_UNIT bucket
+        // Trigger threshold is 1152; midpoints run 64, 192, ... so 1216 (bucket 9) is the first.
+        assert_eq!(drift_drop_frames(1152, target, band, 8192), 0, "at the threshold, silent");
+        let drop = drift_drop_frames(1216, target, band, 8192);
+        assert_eq!(drop, 192);
+        // Post-trim the trough sits at ~target, which reports as bucket 8 (midpoint 1088).
+        assert_eq!(drift_drop_frames(1216 - drop + 64, target, band, 8192), 0);
+    }
+
+    /// The measured live case: `@usb` at 42 min, trough 3904 f against a 1024 f setpoint.
+    #[test]
+    fn drift_regulator_sheds_the_measured_ratchet() {
+        assert_eq!(drift_drop_frames(3904, 1024, READY_BAND, 8192), 2880);
+    }
+
+    /// The window statistic and the instant of the trim are different points on the sawtooth, so
+    /// the FIFO can hold less than the trough says. Never ask for more than is there.
+    #[test]
+    fn drift_regulator_is_capped_by_what_the_fifo_holds() {
+        assert_eq!(drift_drop_frames(3904, 1024, READY_BAND, 500), 500);
     }
 
     #[test]
