@@ -16,14 +16,20 @@ What it measures vs assumes:
 
   MEASURED   ALSA capture buffer occupancy   /proc/asound/<card>/pcm0c/sub0/status
   MEASURED   arecord -> extractor pipe fill  FIONREAD, exact bytes->ms (S32 2ch)
-  APPROX     extractor -> ffmpeg pipe fill   FIONREAD exactly; bytes->ms uses a nominal
+  APPROX     extractor -> decoder pipe fill  FIONREAD exactly; bytes->ms uses a nominal
                                              per-codec bitrate (compressed ES), so the
                                              ms is approximate but the magnitude is not
-  MEASURED   ffmpeg -> pw-cat pipe fill      FIONREAD, exact bytes->ms (f32 6ch 48k)
-  MEASURED   transmitter reader backlog      ndi-output's own [tx window] log line
-  ASSUMED    ffmpeg decode frame             one frame: 1536 spl (DD+/AC-3), 512 (DTS)
+  MEASURED   decoder -> trim pipe fill       FIONREAD, exact bytes->ms (f32 6ch 48k)
+  MEASURED   pcm-trim reservoir              its own `pcm-trim: fifo Xms` journal line —
+                                             an in-process bytearray, so FIONREAD is
+                                             blind to it and the pipes each side read 0
+  MEASURED   trim -> pw-cat pipe fill        FIONREAD, exact bytes->ms (f32 6ch 48k)
+  ASSUMED    decoder frame                   one frame: 1536 spl (DD+/AC-3), 512 (DTS)
   ASSUMED    pw-cat --latency                1536 frames @48k, from the unit's cmdline
   ASSUMED    PipeWire graph to ndi-tx-in     3 x 512/96k
+
+Pipeline, as classified (the decoder is gst-launch-1.0 unless the DECODER drop-in
+selects ffmpeg):  arecord -> tv_ac3_extract -> decoder -> pcm_backlog_trim -> pw-cat
 
 The ASSUMED terms are structural constants, not guesses, but they are labelled so a
 total can never be quoted as fully measured.
@@ -72,8 +78,11 @@ def active_codec():
     return None
 
 
-def cgroup_pids(codec):
-    """Every PID in the bridge unit's cgroup, in start order."""
+STAGES = {"arecord", "extract", "decode", "trim", "pwcat"}
+
+
+def cgroup_pids(codec, fatal=False):
+    """Every PID in the bridge unit's cgroup, in start order. [] once it is gone."""
     out = sh("systemctl", "show", f"earc-bitstream-bridge@{codec}.service",
              "-p", "ControlGroup").strip()
     cg = out.split("=", 1)[1] if "=" in out else ""
@@ -82,7 +91,9 @@ def cgroup_pids(codec):
         with open(path) as f:
             return sorted(int(x) for x in f.read().split())
     except OSError as e:
-        sys.exit(f"cannot read the unit's cgroup ({path}): {e}\nRun with sudo.")
+        if fatal:
+            sys.exit(f"cannot read the unit's cgroup ({path}): {e}\nRun with sudo.")
+        return []
 
 
 def cmdline(pid):
@@ -94,7 +105,14 @@ def cmdline(pid):
 
 
 def classify(pids):
-    """Map the four pipeline stages to PIDs by inspecting their command lines."""
+    """Map the pipeline stages to PIDs by inspecting their command lines.
+
+    ★ The decoder is `gst-launch-1.0` and has been since 2026-08-01; the
+    DECODER=gst|ffmpeg drop-in keeps ffmpeg selectable, so both are matched. And
+    `pcm_backlog_trim.py` sits between the decoder and pw-cat. Matching only "ffmpeg" —
+    as this did until 2026-09-01 — dropped the extractor->decoder pipe AND the whole
+    reservoir from every total it printed, under one "missing: ffmpeg" warning.
+    """
     stage = {}
     for pid in pids:
         c = cmdline(pid)
@@ -102,11 +120,31 @@ def classify(pids):
             stage["arecord"] = pid
         elif "tv_ac3_extract" in c:
             stage["extract"] = pid
-        elif c.startswith("ffmpeg") or " ffmpeg " in c or "/ffmpeg" in c:
-            stage["ffmpeg"] = pid
+        elif "pcm_backlog_trim" in c:
+            stage["trim"] = pid
+        elif "gst-launch" in c or c.startswith("ffmpeg") or " ffmpeg " in c or "/ffmpeg" in c:
+            stage["decode"] = pid
         elif "pw-cat" in c:
             stage["pwcat"] = pid
     return stage
+
+
+def trim_reservoir_ms(codec):
+    """The pcm_backlog_trim reservoir depth, in ms, from the trim's own accounting.
+
+    ★ INVISIBLE TO FIONREAD — it is an in-process bytearray, the same trap as the
+    extractor's BufferedReader below. The trim prints its own byte count every 10 s, so
+    read that instead of the pipes around it. Bounded to the last 20 s so a line left by
+    a previous instance can never be picked up as if it were current.
+    """
+    out = sh("journalctl", "-u", f"earc-bitstream-bridge@{codec}.service",
+             "--since", "-20s", "--no-pager", "-o", "cat")
+    seen = None
+    for line in out.splitlines():
+        g = re.search(r"pcm-trim: fifo ([\d.]+)ms", line)
+        if g:
+            seen = float(g.group(1))
+    return seen
 
 
 def pipe_fill(pid, fd):
@@ -178,18 +216,32 @@ def sample(codec, stage):
     # so AC-3 and DTS carry 4x more hidden delay here than DD+ does.
     rows.append((f"extractor read granularity (1024 fr @{cr//1000}k)",
                  1024 / cr * 1000, "ASSUMED"))
-    if "ffmpeg" in stage:
-        b = pipe_fill(stage["ffmpeg"], 0)
+    if "decode" in stage:
+        b = pipe_fill(stage["decode"], 0)
         if b is not None:
-            rows.append((f"extractor -> ffmpeg pipe ({b} B compressed)",
+            rows.append((f"extractor -> decoder pipe ({b} B compressed)",
                          b / ES_BYTES_PER_SEC[codec] * 1000, "APPROX"))
+
+    rows.append((f"decoder frame ({DECODE_FRAME[codec]} spl)",
+                 DECODE_FRAME[codec] / ES_RATE * 1000, "ASSUMED"))
+
+    if "trim" in stage:
+        b = pipe_fill(stage["trim"], 0)
+        if b is not None:
+            rows.append(("decoder -> trim pipe", b / OUT_BYTES_PER_SEC * 1000, "MEASURED"))
+
+    # ★ The single largest term on this path and the one the probe was blind to until
+    # 2026-09-01: a deliberate reservoir, 25-57 ms across the codecs measured that night.
+    res = trim_reservoir_ms(codec)
+    if res is not None:
+        rows.append(("pcm-trim reservoir (its own byte count)", res, "MEASURED"))
+    else:
+        unknown.append("pcm-trim reservoir (no `fifo` line in the last 20 s)")
+
     if "pwcat" in stage:
         b = pipe_fill(stage["pwcat"], 0)
         if b is not None:
-            rows.append(("ffmpeg -> pw-cat pipe", b / OUT_BYTES_PER_SEC * 1000, "MEASURED"))
-
-    rows.append((f"ffmpeg decode frame ({DECODE_FRAME[codec]} spl)",
-                 DECODE_FRAME[codec] / ES_RATE * 1000, "ASSUMED"))
+            rows.append(("trim -> pw-cat pipe", b / OUT_BYTES_PER_SEC * 1000, "MEASURED"))
 
     lat = pwcat_latency_frames(stage["pwcat"]) if "pwcat" in stage else None
     if lat:
@@ -217,17 +269,36 @@ def main():
     if not codec:
         sys.exit("no earc-bitstream-bridge@{eac3,ac3,dts} is active — "
                  "start playback of a bitstream source first.")
-    pids = cgroup_pids(codec)
-    stage = classify(pids)
-    missing = {"arecord", "extract", "ffmpeg", "pwcat"} - set(stage)
+    stage = classify(cgroup_pids(codec, fatal=True))
 
     print(f"bridge   : earc-bitstream-bridge@{codec}  "
           f"(carrier {CARRIER_RATE[codec]} Hz, decode frame {DECODE_FRAME[codec]} spl)")
     print(f"stages   : " + "  ".join(f"{k}={v}" for k, v in stage.items()))
-    if missing:
-        print(f"⚠ missing : {', '.join(sorted(missing))} — totals will be incomplete")
+    if STAGES - set(stage):
+        print(f"⚠ missing : {', '.join(sorted(STAGES - set(stage)))} — totals will be incomplete")
 
     while True:
+        # ★ Re-read the stage PIDs EVERY sample. The bridge restarts whenever the source
+        # restarts — rewinding a clip is enough — and stale PIDs do NOT raise: pipe_fill
+        # returns None and `pw-cat --latency` vanishes off the dead cmdline, so its 32 ms
+        # silently leaves the total while every line still looks plausible. That cost 13
+        # of 14 DTS samples on 2026-09-01; the `assumed` figure moving was the only tell.
+        live = active_codec()
+        if live is None:
+            print("\n⚠ no bitstream bridge active — waiting")
+            if not args.watch:
+                break
+            time.sleep(args.interval)
+            continue
+        fresh = classify(cgroup_pids(live))
+        if (live, fresh) != (codec, stage):
+            codec, stage = live, fresh
+            print(f"\n★ stages re-read : earc-bitstream-bridge@{codec}  "
+                  + "  ".join(f"{k}={v}" for k, v in stage.items()))
+            if STAGES - set(stage):
+                print(f"⚠ missing : {', '.join(sorted(STAGES - set(stage)))} "
+                      f"— totals will be incomplete")
+
         rows, unknown = sample(codec, stage)
         print()
         measured = assumed = 0.0
@@ -240,7 +311,10 @@ def main():
         print(f"  {'-'*44} {'-'*7}")
         print(f"  {'measured':<44s} {measured:7.2f} ms")
         print(f"  {'assumed (structural constants)':<44s} {assumed:7.2f} ms")
-        print(f"  {'TOTAL Pi-side (capture -> NDI out)':<44s} {measured+assumed:7.2f} ms")
+        total_label = "TOTAL Pi-side (capture -> NDI out)"
+        if unknown:
+            total_label += "  [INCOMPLETE]"
+        print(f"  {total_label:<44s} {measured+assumed:7.2f} ms")
         for u in unknown:
             print(f"  ⚠ not counted: {u}")
         if not args.watch:
