@@ -206,13 +206,35 @@ def do_report(hours):
                 near += 1
         print(f"bridge starts within 10 s of one: {near}/{len(starts)}")
 
-    covered = {r[2] for r in rows if r[3] == "window" and r[4]}
-    missing = [s for s in SOURCES if s not in covered]
-    print(f"\nsources covered: {', '.join(sorted(covered)) or 'none'}"
+    # ── Verdict gate. ──
+    # ⛔ DELIBERATELY HARD TO SATISFY. The whole reason this collector exists is that the
+    # capture question was answered from ONE source over ~70 s, and this project's recurring
+    # failure is a conclusion drawn from too little. So: no verdict until at least two sources
+    # have been seen and each has enough windows to be more than a warm-up transient. A blank
+    # "not yet" is the correct output for a watch that has not run long enough.
+    MIN_SOURCES, MIN_WINDOWS = 2, 180   # 180 windows = ~30 min of bridge uptime per source
+    per_src = {}
+    for src in SOURCES:
+        n = len([r for r in rows if r[2] == src and r[3] == "window" and r[4]])
+        if n:
+            per_src[src] = n
+    missing = [s for s in SOURCES if s not in per_src]
+    thin = [f"{s}({per_src[s]})" for s in per_src if per_src[s] < MIN_WINDOWS]
+    print(f"\nsources covered: {', '.join(f'{s}({n})' for s, n in sorted(per_src.items())) or 'none'}"
           + (f"   STILL MISSING: {', '.join(missing)}" if missing else "   (all)"))
-    if verdict_ok and covered:
-        print("verdict: every covered source keeps its capture trough under 2 periods —"
-              " the reset's skip stays negligible.")
+
+    if len(per_src) < MIN_SOURCES or thin:
+        print(f"verdict: NOT YET CONCLUSIVE — need >={MIN_SOURCES} sources with >={MIN_WINDOWS}"
+              f" windows each" + (f"; thin so far: {', '.join(thin)}" if thin else "")
+              + ".\n         @usb matters most: isochronous, granted 170/2720, and the arm"
+                " exposed to the rail.")
+    elif verdict_ok:
+        print(f"verdict: {len(per_src)} sources, all keeping the capture trough under two"
+              " periods. The race reset's skip of this compartment stays negligible;"
+              " no capture-side clear is warranted.")
+    else:
+        print("verdict: A SOURCE IS HOLDING A DEEP CAPTURE TROUGH (flagged above)."
+              " Re-open B1 — check that source against the under-voltage column first.")
     print()
 
 
