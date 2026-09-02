@@ -70,9 +70,9 @@
 #   ever be absorbed by eventually xrunning. PipeWire's adapter is ADAPTIVE, so moving
 #   the SRC there closes a structural gap rather than merely relocating a filter.
 #
-# resample.quality=12 (256-tap sinc). Every other source on this box runs q14 (1024 taps),
-# and this path started there, but q14's group delay is ~n_taps/2 at the INPUT rate =
-# ~512/48000 = 10.7ms, versus ~2.7ms at q12 — real latency spent on SRC precision that is
+# resample.quality=12 (256-tap sinc). This path started at q14, but q14's group delay is
+# ~n_taps/2 at the INPUT rate = ~512/48000 = 10.7ms, versus ~2.7ms at q12 — real latency
+# spent on SRC precision that is
 # already far below the noise floor of a lossy codec. On the pristine Lyrion path that
 # trade would be wrong; here latency wins. Both are computed from PipeWire's quality
 # table (q12 = 256 taps, q14 = 1024), NOT measured — the delay is not exposed in pw-dump.
@@ -81,6 +81,12 @@
 # is daemon-side, so it reaches in-daemon streams (module-bluez5) but NOT a separate
 # client process like pw-cat — verified by pw-dump, which showed no resample.quality on
 # this node at all before this was added.
+# ⛔ This comment used to add "Every other source on this box runs q14 (1024 taps)". That was
+# false BY THIS PARAGRAPH'S OWN ARGUMENT, and it made the trade above look like a concession.
+# Re-verified with pw-dump 2026-09-03: dsp-in, dsp-out and ndi-tx-in all run the default q4,
+# because they are separate-process clients too. module-bluez5 is the only q14 consumer on the
+# box. This path is therefore not below the house standard — it is the only source that sets
+# the property deliberately at all.
 #
 # Teardown: systemd KillMode=control-group + KillSignal=SIGKILL tears down the whole
 # pipeline cgroup on `systemctl stop`, so no manual child management is needed here.
@@ -297,7 +303,16 @@ fi
 #   2026-08-25: pw-cat drank the whole reservoir every cycle — sustained ~62
 #   dry/re-prime cycles/s, each a forwarding gap. Reverted same day; zero dry-outs
 #   in all 64 ms history.
-arecord -D "$IN_DEVICE" -f S32_LE -r "$RATE" -c 2 -t raw \
+# ── RT on the capture stage ONLY (2026-09-03) ──
+# arecord on an I2S slave has the hard deadline in this pipeline; every stage below it is
+# buffered and reschedulable. ⛔ Do NOT promote the whole pipe (a unit-wide
+# CPUSchedulingPolicy=fifo would): `decode` is GStreamer, i.e. the compute, and it must not
+# preempt anything. FIFO 20 matches ardftsrc-bridge and ndi-output — above every SCHED_OTHER
+# process, far below PipeWire's graph threads (83-88).
+# `chrt` failing must not take the TV down, so fall back to plain arecord.
+CHRT=(chrt -f 20)
+command -v chrt >/dev/null 2>&1 || CHRT=()
+"${CHRT[@]}" arecord -D "$IN_DEVICE" -f S32_LE -r "$RATE" -c 2 -t raw \
         --buffer-time=40000 --period-time=5000 2>/dev/null \
   | python3 "$EXTRACT" "${EXTRACT_ARGS[@]}" \
   | decode \

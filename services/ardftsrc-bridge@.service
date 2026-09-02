@@ -18,6 +18,19 @@ Type=simple
 Environment=XDG_RUNTIME_DIR=/run/pipewire
 Environment=PIPEWIRE_REMOTE=pipewire-0
 ExecStart=/opt/vibesbox-src/bin/ardftsrc-bridge %i
+# ── RT scheduling (2026-09-03) ──
+# ⛔ Deliberately NOT CPUSchedulingPolicy=fifo. That would promote the WHOLE process, and this
+# process's other thread runs the DFT — a long, bursty compute that must not preempt anything.
+# The bridge promotes its CAPTURE thread only, from inside (set_capture_thread_fifo in
+# src/main.rs), to FIFO 20: the same priority ndi-output uses and for the same reason — above
+# every SCHED_OTHER process, far below PipeWire's audio-graph threads (FIFO 83-88), so the
+# graph this feeds can never be starved by its own producer.
+# Until this, the thread blocking in readi on an isochronous USB gadget / I2S slave ran
+# SCHED_OTHER, competing on equal terms with the QML kiosk.
+# LimitRTPRIO is belt-and-braces: as User=root the promotion already succeeds via CAP_SYS_NICE,
+# but this keeps it working if the unit is ever moved off root. Set ARDFTSRC_CAP_RTPRIO=0 in a
+# drop-in to A/B the old behaviour without rebuilding.
+LimitRTPRIO=21
 # Bridge-down = source-dead (the source can't reach dsp-in without it), so self-heal fast
 # (spec §6). Keep SIGKILL (snd_pcm_readi can block uninterruptibly on isochronous hw reads).
 Restart=on-failure

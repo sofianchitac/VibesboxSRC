@@ -173,6 +173,32 @@ const RING_HIST_BUCKETS: usize = 48;  // 0..6144 frames; the last bucket is an o
 const READY_HIST_UNIT: usize = 128;   // 1.3 ms @96k
 const READY_HIST_BUCKETS: usize = 96; // 0..12288 frames (128 ms) — ~2x the widest gate ceiling
 
+// ── Fine CAPTURE-depth statistic (2026-09-03). Also purely an instrument. ──
+//
+// ⛔ THE LAST COMPARTMENT WITHOUT A DISTRIBUTION, and the omission was structural rather than
+// deliberate. The ring got `ring_hist` and the resampler FIFO got `ready_hist` — and it was
+// `ready_hist` that found the drift ratchet eight weeks after the fact. Capture had only two
+// POINT SAMPLES: `cap=` (`pcm.delay()` after `readi`, one overwritten atomic) and `readq=`
+// (the block time, likewise). This file's own standing rule is that a point sample of a
+// sawtooth is not its mean and that a whole hypothesis was once built on treating it as one —
+// so capture was the one place still exempt from the rule everything else is held to.
+//
+// ⇒ WHY IT MATTERS RIGHT NOW. The race reset zeroes the ring and rebuilds the resampler, and
+// deliberately keeps `out`. It does NOT touch the ALSA capture ring, which holds up to the
+// granted buffer — 2720 f on the USB gadget (61.7 ms @44.1k), 4096 f on Lyrion/eARC (85.3 ms
+// @48k). ⛔⛔ THAT IS CAPACITY, NOT OCCUPANCY: if the capture thread keeps up, occupancy at the
+// reset is about one period and the gap is worth ~5 ms, not 60. Quoting the capacity would be
+// exactly the amplitude-vs-pedestal error §5b records. Nothing here can currently tell the two
+// apart, which is why no capture-side clear is being written until this has been read.
+//
+// ⚠ INSTRUMENT ONLY. It feeds no decision and changes no behaviour, per the standing rule that
+// the instrument and the threshold move in separate steps. Read `capp10` across a race reset
+// first; the shed is only worth writing if the trough is materially above one period.
+//
+// In INPUT frames at `rate`, because that is what `pcm.delay()` counts on the capture side.
+const CAP_HIST_UNIT: usize = 128;    // 2.9 ms @44.1k — same resolution as the ring's
+const CAP_HIST_BUCKETS: usize = 40;  // 0..5120 frames — clears the widest grant (4096) with room
+
 // ── The drift regulator (2026-08-29). The instrument above finally FEEDS a decision. ──
 //
 // ★ MEASURED, live, two sources: `readyp10` — the resampler FIFO's TROUGH, i.e. the part no write
@@ -673,17 +699,47 @@ fn open_pcm(
         pcm.hw_params(&hwp)?;
     }
     pcm.prepare()?;
-    // ⚠ `set_*_near` is a REQUEST, not a setting, and nothing has ever checked what came
-    // back. That matters: `out=` peaks at 3578 against a nominal 3072, which is either a
-    // grant that differs from the ask or `delay()` including graph-side buffering — and
-    // until it is known, every "OUT_BUFFER is worth N ms" claim rests on the requested
-    // number rather than the real one. Printed once per open, so it costs nothing.
+    // ⚠ `set_*_near` is a REQUEST, not a setting. ✅ ANSWERED — the grant is read back here
+    // and the answers are in the ledger's config table: `hw:UAC2Gadget,0,0` gives 170/2720
+    // against a 256/4096 ask, while `hw:Lyrion,1,0`, `hw:eARC,0` and the `pipewire` playback
+    // PCM all grant exactly what they are asked. Keep printing it: every run then
+    // self-verifies rather than resting on the requested number.
     if let Ok(cur) = pcm.hw_params_current() {
         eprintln!(
             "ardftsrc-bridge: {device} {} hw granted period={} buffer={} (requested {period}/{buffer})",
             match dir { Direction::Capture => "capture", Direction::Playback => "playback" },
             cur.get_period_size().map(|v| v.to_string()).unwrap_or_else(|_| "?".into()),
             cur.get_buffer_size().map(|v| v.to_string()).unwrap_or_else(|_| "?".into()),
+        );
+    }
+    // ── The sw_params this open INHERITS. Nothing here ever SETS them, so they are whatever
+    //    alsa-lib and (on the output side) the `pipewire` plugin choose. ──
+    //
+    // ★ MEASURED 2026-09-03 with a standalone probe that mirrors this function exactly, on
+    // `hw:Resampled,1,0` (the unused card, so no live path was touched), `hw:Lyrion,1,0` and
+    // the `pipewire` playback PCM. All three came back IDENTICAL in shape:
+    //     start_threshold = 1        stop_threshold = buffer_size
+    //     avail_min       = granted period          silence_threshold/size = 0
+    //
+    // ⛔ SO THE OBVIOUS "FIX" IS A REGRESSION, AND THIS COMMENT EXISTS TO STOP IT BEING TRIED.
+    // The generic advice for deterministic startup is `set_start_threshold(period_size)`. That
+    // is PLAYBACK advice. Here `start_threshold` is already 1 on BOTH streams, which is the
+    // minimum possible: capture auto-starts on the first `readi` and playback goes live on the
+    // first `writei`, with no "wait for N frames" delay to phase against. Raising it would ADD
+    // a startup hold, not remove one.
+    //
+    // ⇒ The one knob genuinely untested is `stop_threshold`: at `buffer_size` an xrun STOPS the
+    // stream and `write_all`/`try_recover` re-prepares it, which redraws that stream's phase.
+    // Setting it to `boundary` would free-run through an xrun instead. Untested, no evidence it
+    // fires in steady state (0 graph xruns over days), and it is a semantics change — so it is
+    // recorded, not shipped.
+    if let Ok(sw) = pcm.sw_params_current() {
+        eprintln!(
+            "ardftsrc-bridge: {device} {} sw inherited start_thr={} stop_thr={} avail_min={} (never set here)",
+            match dir { Direction::Capture => "capture", Direction::Playback => "playback" },
+            sw.get_start_threshold().map(|v| v.to_string()).unwrap_or_else(|_| "?".into()),
+            sw.get_stop_threshold().map(|v| v.to_string()).unwrap_or_else(|_| "?".into()),
+            sw.get_avail_min().map(|v| v.to_string()).unwrap_or_else(|_| "?".into()),
         );
     }
     Ok(pcm)
@@ -707,6 +763,58 @@ const HEADROOM: f64 = 0.630_957_344_480_193_4; // 10^(-4/20) = -4.0 dB
 #[inline]
 fn f64_to_i32(x: f64) -> i32 {
     ((x * HEADROOM).clamp(-1.0, 1.0) * 2_147_483_647.0) as i32 // 2^31 - 1
+}
+
+/// Default RT priority for the CAPTURE THREAD ONLY. 0 disables; override with
+/// `ARDFTSRC_CAP_RTPRIO` (a systemd drop-in) so the arm can be A/B'd without a rebuild —
+/// the standard protocol here is one variable per binary swap, and a rebuild is not one.
+const CAP_RTPRIO_DEFAULT: i32 = 20;
+
+/// Put the CALLING thread on SCHED_FIFO at `prio`. Returns the priority actually in force.
+///
+/// ★ 2026-09-03. Until now nothing in this chain except `ndi-output` had any scheduling
+/// policy: `systemctl show ardftsrc-bridge@usb -p CPUSchedulingPolicy` returned 0
+/// (SCHED_OTHER) for every bridge, for `camilladsp` and for `source-router`. CamillaDSP is
+/// covered anyway — its `data-loop.0` threads get FIFO 83 client-side from root's
+/// CAP_SYS_NICE — and so is this process's own graph thread. What was NOT covered is the
+/// thread with the hardest deadline in the whole chain: the one blocking in `readi` on an
+/// isochronous USB gadget or an I2S slave, which at SCHED_OTHER competes on equal terms
+/// with the QML kiosk.
+///
+/// ⛔ CAPTURE THREAD ONLY, deliberately. A unit-level `CPUSchedulingPolicy=fifo` would also
+/// promote the PROCESS thread, and that thread runs the DFT — a long, bursty compute that
+/// must not be allowed to preempt anything. This thread does almost no work per wakeup
+/// (readi -> f64 -> push), which is exactly the profile RT is for.
+///
+/// ⚠ 20 mirrors `ndi-output.service`, and the reason there governs here: it preempts every
+/// SCHED_OTHER process while staying far below PipeWire's audio-graph threads (FIFO 83-88),
+/// so promoting this can never starve the graph it feeds.
+///
+/// Non-fatal by design: the bridge runs as root (CAP_SYS_NICE), but a future non-root move
+/// or a missing RLIMIT_RTPRIO must degrade to the old SCHED_OTHER behaviour, not fail to
+/// carry audio.
+fn set_capture_thread_fifo() -> i32 {
+    let prio = std::env::var("ARDFTSRC_CAP_RTPRIO")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(CAP_RTPRIO_DEFAULT);
+    if prio <= 0 {
+        return 0;
+    }
+    // SAFETY: `param` is a fully-initialised sched_param; pthread_self() is always valid.
+    let ok = unsafe {
+        let param = libc::sched_param { sched_priority: prio };
+        libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) == 0
+    };
+    if ok {
+        prio
+    } else {
+        eprintln!(
+            "ardftsrc-bridge: could not set capture thread SCHED_FIFO {prio} \
+             (need CAP_SYS_NICE or LimitRTPRIO) — continuing at SCHED_OTHER"
+        );
+        0
+    }
 }
 
 /// Write a full interleaved buffer, recovering from xruns, until all frames land.
@@ -887,6 +995,13 @@ fn main() {
     // fact helps: the detector fires within ~60ms and we exit before the overruns matter.
     let cap_is_tv = cfg.name == "tv";
     let capture = thread::spawn(move || {
+        // Promote BEFORE opening the device, so the very first readi — the one whose wakeup
+        // phase the start draw is latched from — already runs at the priority the rest will.
+        let cap_prio = set_capture_thread_fifo();
+        eprintln!(
+            "ardftsrc-bridge: capture thread {}",
+            if cap_prio > 0 { format!("SCHED_FIFO {cap_prio}") } else { "SCHED_OTHER".into() }
+        );
         let pcm = match open_pcm(&cap_device, Direction::Capture, rate, cap_channels as u32, CAP_PERIOD, CAP_BUFFER) {
             Ok(p) => p,
             Err(e) => {
@@ -1089,10 +1204,14 @@ fn main() {
     // keeps being wrong — it moved the reservoir instead of removing it. The FIFO has no drop path,
     // so every frame the gate permits is untrimmable latency: three blocks is ~117 ms at 48k, and an
     // unbounded pop on top of that reaches ~203 ms. Worse, it binds on EVERY BRIDGE START — the
-    // startup one-shot below exists to drop the 2-5 capture periods (43-107 ms) of graph-link
-    // residue, and a ceiling that deep swallows all of it before the ring ever sees it, so the trim
-    // drops nothing and the residue becomes permanent. The measurement protocol restarts the bridge
-    // for every run, so that would have contaminated every number taken.
+    // startup one-shot below exists to drop the 2-5 capture periods (10.7-26.7 ms @48k) of
+    // graph-link residue, and a ceiling that deep swallows all of it before the ring ever sees it,
+    // so the trim drops nothing and the residue becomes permanent. The measurement protocol
+    // restarts the bridge for every run, so that would have contaminated every number taken.
+    // ⚠ That range read "43-107 ms" until 2026-09-03, computed at CAP_PERIOD 1024 and never
+    // updated when it became 256 on 2026-08-19. The reset's TRIGGER never depended on it — it is
+    // `out_frames_written > 2 * OUT_BUFFER`, in output frames — but the figure was being quoted as
+    // the size of what the reset recovers, which is a different and 4x larger claim.
     //
     // Steady-state peak is exactly one block: the resampler emits a whole block at once and we drain
     // it over the following passes. One period of slack keeps the gate off the boundary. If it binds
@@ -1162,6 +1281,9 @@ fn main() {
     // Fine time-weighted distribution of the RESAMPLER'S OUTPUT FIFO. Read as a pair with
     // ring_hist — see READY_HIST_UNIT for why neither means anything alone under this loop.
     let mut ready_hist = [Duration::ZERO; READY_HIST_BUCKETS + 1];
+    // Time-weighted distribution of the ALSA CAPTURE ring's residual depth, in CAP_HIST_UNIT
+    // input frames. The one compartment the race reset does not clear — see CAP_HIST_UNIT.
+    let mut cap_hist = [Duration::ZERO; CAP_HIST_BUCKETS + 1];
     let mut window_time = Duration::ZERO;
     let mut last_poll = Instant::now();
     // One source of truth for the trim threshold: the in-loop `keep` binds to this, and the
@@ -1230,6 +1352,12 @@ fn main() {
             depth_hist[(avail / keep_elems).min(DEPTH_BUCKETS)] += dt;
             ring_hist[(avail / channels / RING_HIST_UNIT).min(RING_HIST_BUCKETS)] += dt;
             ready_hist[(ready_frames_now / READY_HIST_UNIT).min(READY_HIST_BUCKETS)] += dt;
+            // `cap_delay_frames` is -1 until the first successful readi; a negative depth is
+            // "not yet known", not zero, so it must not be folded in as an empty bucket.
+            let cap_now = cap_delay_frames.load(Ordering::Relaxed);
+            if cap_now >= 0 {
+                cap_hist[(cap_now as usize / CAP_HIST_UNIT).min(CAP_HIST_BUCKETS)] += dt;
+            }
         }
 
         // ── Backlog trims. In-flight audio is CONSERVED in this pipeline (input and
@@ -1385,11 +1513,22 @@ fn main() {
                 ring_pct(&ready_hist, READY_HIST_UNIT, 0.90),
             );
             let o2ms = |f: usize| f as f64 * 1000.0 / TARGET_RATE as f64;
+            // ★ The ALSA capture ring over the SAME window — the compartment the race reset
+            // leaves alone. `capp10` is the TROUGH, i.e. the part no read ever takes, i.e. the
+            // standing depth a capture-side clear would actually shed; `capp90 - capp10` is
+            // just the read quantum's sawtooth and sheds nothing. ⛔ Read the trough, not the
+            // fill — that distinction is what §7.9 cost a run to learn.
+            let (cap10, cap50, cap90) = (
+                ring_pct(&cap_hist, CAP_HIST_UNIT, 0.10),
+                ring_pct(&cap_hist, CAP_HIST_UNIT, 0.50),
+                ring_pct(&cap_hist, CAP_HIST_UNIT, 0.90),
+            );
             eprintln!(
-                "ardftsrc-bridge[diag window]: low={:.1}% deep={:.1}% persistent={persistent}                  strikes={floor_strikes} armed={floor_armed} bursts={trim_bursts}                  hist%=[{}] ringp10/50/90={p10}/{p50}/{p90}f({:.1}/{:.1}/{:.1}ms)                  readyp10/50/90={rdy10}/{rdy50}/{rdy90}f({:.1}/{:.1}/{:.1}ms) trim={}",
+                "ardftsrc-bridge[diag window]: low={:.1}% deep={:.1}% persistent={persistent}                  strikes={floor_strikes} armed={floor_armed} bursts={trim_bursts}                  hist%=[{}] capp10/50/90={cap10}/{cap50}/{cap90}f({:.1}/{:.1}/{:.1}ms)                  ringp10/50/90={p10}/{p50}/{p90}f({:.1}/{:.1}/{:.1}ms)                  readyp10/50/90={rdy10}/{rdy50}/{rdy90}f({:.1}/{:.1}/{:.1}ms) trim={}",
                 if total > 0.0 { depth_hist[0].as_secs_f64() / total * 100.0 } else { 100.0 },
                 deep_frac * 100.0,
                 hist_pct.join(","),
+                f2ms(cap10), f2ms(cap50), f2ms(cap90),
                 f2ms(p10), f2ms(p50), f2ms(p90),
                 o2ms(rdy10), o2ms(rdy50), o2ms(rdy90),
                 if trim_to_keep { trim_tag } else { "-" }
@@ -1459,6 +1598,7 @@ fn main() {
             depth_hist = [Duration::ZERO; DEPTH_BUCKETS + 1];
             ring_hist = [Duration::ZERO; RING_HIST_BUCKETS + 1];
             ready_hist = [Duration::ZERO; READY_HIST_BUCKETS + 1];
+            cap_hist = [Duration::ZERO; CAP_HIST_BUCKETS + 1];
             window_time = Duration::ZERO;
             floor_since = Instant::now();
         }
@@ -1679,6 +1819,11 @@ fn main() {
             race_reset_done = true;
             let pre_ring = cons.occupied_len();
             let pre_ready = rs.num_samples_ready();
+            // ⚠ Sampled, NOT cleared. This is the whole open question: the reset zeroes every
+            // other reachable compartment at one instant, and this one is left holding whatever
+            // it holds. One point sample is not the answer — `capp10` on the window lines either
+            // side of this is — but printing it here at least dates the sample to the reset.
+            let pre_cap = cap_delay_frames.load(Ordering::Relaxed);
 
             // 1. ring -> 0.
             loop {
@@ -1719,6 +1864,7 @@ fn main() {
             depth_hist = [Duration::ZERO; DEPTH_BUCKETS + 1];
             ring_hist = [Duration::ZERO; RING_HIST_BUCKETS + 1];
             ready_hist = [Duration::ZERO; READY_HIST_BUCKETS + 1];
+            cap_hist = [Duration::ZERO; CAP_HIST_BUCKETS + 1];
             window_time = Duration::ZERO;
             last_poll = Instant::now();
             floor_armed = true;
@@ -1727,13 +1873,15 @@ fn main() {
 
             eprintln!(
                 "ardftsrc-bridge[diag race-reset]: consumer proven draining at {}f written; \
-                 shed ring={}f({:.1}ms) ready={}f({:.1}ms) out=KEPT {}f",
+                 shed ring={}f({:.1}ms) ready={}f({:.1}ms) out=KEPT {}f cap=NOT-CLEARED {}f({:.1}ms)",
                 out_frames_written,
                 pre_ring / channels,
                 (pre_ring / channels) as f64 * 1000.0 / rate as f64,
                 pre_ready / channels,
                 (pre_ready / channels) as f64 * 1000.0 / TARGET_RATE as f64,
                 out_pcm.delay().unwrap_or(-1),
+                pre_cap,
+                if pre_cap < 0 { 0.0 } else { pre_cap as f64 * 1000.0 / rate as f64 },
             );
         }
     }

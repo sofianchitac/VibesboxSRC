@@ -19,6 +19,12 @@ Type=simple
 Environment=XDG_RUNTIME_DIR=/run/pipewire
 Environment=PIPEWIRE_REMOTE=pipewire-0
 ExecStart=/opt/vibesbox-src/scripts/earc-bitstream-bridge.sh %i
+# ── RT scheduling (2026-09-03) ──
+# Same reasoning as ardftsrc-bridge@.service, same reason for NOT setting a unit-wide policy:
+# this ExecStart is a four-stage pipe and only the FIRST stage has a hard deadline. A unit-wide
+# fifo would also promote the GStreamer decoder, which is the compute. The script instead wraps
+# arecord alone in `chrt -f 20`; this rlimit is what lets that succeed off root.
+LimitRTPRIO=21
 # Bridge-down = TV-source-dead, so self-heal fast. SIGKILL + control-group teardown
 # kills the whole arecord|python|ffmpeg|pw-cat pipeline on stop (arecord blocks
 # indefinitely on an I2S slave capture with no bit clock, so it cannot be relied on
