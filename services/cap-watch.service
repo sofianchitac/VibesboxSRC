@@ -1,0 +1,19 @@
+[Unit]
+# INVESTIGATION SCAFFOLDING, not part of the appliance — see tools/cap_watch.py.
+# Harvests the ardftsrc capture-ring depth (capp10/50/90) out of the journal into a TSV that
+# journald rotation cannot reach (measured 2026-09-03: this box keeps ONE boot, ~2 days).
+# ⛔ READ-ONLY: it parses log lines and touches no device, service or graph node. Safe to run
+# mid-listening.
+# REMOVE WHEN THE QUESTION IS CLOSED:
+#   sudo systemctl disable --now cap-watch.timer
+#   sudo rm /etc/systemd/system/cap-watch.{timer,service} && sudo systemctl daemon-reload
+Description=Collect ardftsrc capture-ring depth samples (latency investigation)
+After=source-router.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/vibesbox-src/tools/cap_watch.py --collect
+User=root
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=300
