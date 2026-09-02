@@ -192,8 +192,22 @@ const READY_HIST_BUCKETS: usize = 96; // 0..12288 frames (128 ms) — ~2x the wi
 // apart, which is why no capture-side clear is being written until this has been read.
 //
 // ⚠ INSTRUMENT ONLY. It feeds no decision and changes no behaviour, per the standing rule that
-// the instrument and the threshold move in separate steps. Read `capp10` across a race reset
-// first; the shed is only worth writing if the trough is materially above one period.
+// the instrument and the threshold move in separate steps.
+//
+// ✅ ANSWERED THE SAME DAY, @lyrion, 7 consecutive windows, pink noise at 44.1k:
+//     capp10/50/90 = 64/64/192 f = 1.5/1.5/4.4 ms
+//     race reset:    cap=NOT-CLEARED 94 f (2.1 ms)
+// ⇒ THE TROUGH IS ~1.5 ms, NOT THE 61.7-85.3 ms THE GRANT ALLOWS. The capture thread keeps up
+// completely; the ring holds well under one 256-frame period and never accumulates. So the
+// compartment the race reset skips is worth about a millisecond, and A CAPTURE-SIDE CLEAR IS NOT
+// WORTH WRITING — which is exactly why this instrument had to come first. Had the shed been
+// written on the capacity figure it would have been justified by a number 40x too large.
+//
+// ⚠ MEASURED ON @lyrion ONLY, i.e. an snd-aloop writer that never misses. NOT yet read on @usb,
+// whose grant is different (170/2720 against the 256/4096 ask) and whose feed is isochronous —
+// and which is the arm that sits under the rail's under-voltage events. If any path ever shows a
+// capp10 materially above one period, this is the compartment to look at and the shed becomes
+// worth reconsidering.
 //
 // In INPUT frames at `rate`, because that is what `pcm.delay()` counts on the capture side.
 const CAP_HIST_UNIT: usize = 128;    // 2.9 ms @44.1k — same resolution as the ring's
