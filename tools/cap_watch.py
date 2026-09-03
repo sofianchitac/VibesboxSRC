@@ -16,9 +16,20 @@ reach.
 ⛔ READ-ONLY AND OFF THE AUDIO PATH. It parses log lines already being written and never
 touches a device, a service or the graph. Safe to run at any time, including mid-listening.
 
-  cap_watch.py --collect            append new samples (what the timer runs)
+  cap_watch.py --collect            append new samples (cap-watch.timer, every 10 min)
   cap_watch.py --report             summarise everything collected so far
   cap_watch.py --report --hours 24  summarise a trailing window
+  cap_watch.py --daily              the 24 h summary cap-watch-report.timer logs once a day
+
+⌀ Anomaly lines are prefixed `<4>` so journald records them at WARNING while the routine
+summary stays at info — `journalctl -u cap-watch-report -p warning` is then exactly the list
+of days something moved, with no parsing.
+
+Two statistics are watched, and they answer DIFFERENT questions. `capp10` is the capture
+ring's trough — the compartment the race reset walks past — and a deep one re-opens B1.
+`readyp10` is the resampler FIFO's trough, the quantity the drift regulator servos; a high one
+means the REGULATOR has stopped holding and is not a capture question at all. ⛔ Do not read
+either as an end-to-end latency figure.
 
 Under-voltage events are collected into the SAME file so the two are time-aligned: if a source
 ever shows a deep capture ring, the first question is whether the rail dipped underneath it.
@@ -30,6 +41,17 @@ TSV = os.environ.get("CAP_WATCH_TSV", "/opt/vibesbox-src/state/cap-watch.tsv")
 SOURCES = ["usb", "lyrion", "airplay", "tidal", "tv"]
 COLS = ["epoch", "iso", "source", "kind", "capp10", "capp50", "capp90", "ringp50", "readyp10"]
 OVERLAP_S = 120  # re-read a little history each pass; dedupe handles the rest
+
+# ── Flag thresholds. Both are "the regulator has stopped holding", not "tune me". ──
+# capp10 at or above TWO capture periods means the capture ring is carrying standing backlog
+# rather than the sub-period slack measured on 2026-09-03 — that would re-open B1.
+CAP_DEEP_F = 512
+# readyp10 is the resampler FIFO's TROUGH in OUTPUT frames, the quantity the drift regulator
+# servos. Its setpoint is one output period (1024 f) with a 128 f band, and the ratchet fault
+# it exists to catch looked like 1088 -> 3904 f over 42 min. 2048 = twice setpoint: comfortably
+# outside normal swing, comfortably inside the fault. ⛔ A trip means the REGULATOR is not
+# holding; it is not a latency reading on its own.
+READY_HIGH_F = 2048
 
 
 def journal(unit=None, kernel=False, since=None):
@@ -166,29 +188,36 @@ def do_report(hours):
     print(f"\ncap_watch — {len(rows)} samples over {span:.1f} h"
           f"   ({datetime.fromtimestamp(min(float(r[0]) for r in rows)):%Y-%m-%d %H:%M}"
           f" -> {datetime.fromtimestamp(max(float(r[0]) for r in rows)):%Y-%m-%d %H:%M})\n")
-    print(f"{'source':<9}{'windows':>8}{'starts':>7}  "
-          f"{'capp10 min/med/max':>22}  {'capp50 med':>11}  {'capp90 max':>11}   trough ms (med)")
-    print("-" * 96)
-    verdict_ok = True
+    print(f"{'source':<9}{'windows':>7}{'starts':>7}  "
+          f"{'capture capp10 min/med/max':>28}{'ms':>7}   "
+          f"{'FIFO readyp10 min/med/max':>27}{'ms':>7}")
+    print("-" * 100)
+    cap_ok = ready_ok = True
     for src in SOURCES:
         w = [r for r in rows if r[2] == src and r[3] == "window" and r[4]]
         if not w:
             continue
         c10 = [int(r[4]) for r in w]
-        c50 = [int(r[5]) for r in w]
-        c90 = [int(r[6]) for r in w]
         st = len([r for r in starts if r[2] == src])
-        # 44.1k is the worst case for ms-per-frame; report against it so the figure is an
-        # upper bound rather than an optimistic one.
+        # 44.1k is the worst case for ms-per-frame on the CAPTURE side; report against it so
+        # the figure is an upper bound rather than an optimistic one.
         med10 = pct(c10, 0.5)
-        ms = med10 * 1000.0 / 44100.0
+        cms = med10 * 1000.0 / 44100.0
+        # readyp10 is at TARGET_RATE (96k) always — it counts output frames.
+        rdy = [int(r[8]) for r in w if r[8]]
+        rmed = pct(rdy, 0.5) if rdy else 0
+        rms = rmed / 96.0
         flag = ""
-        if max(c10) >= 512:          # >= 2 capture periods held at the TROUGH
-            flag = "  <-- DEEP, investigate"
-            verdict_ok = False
-        print(f"{src:<9}{len(w):>8}{st:>7}  "
-              f"{min(c10):>6}/{med10:>6}/{max(c10):>6}f  {pct(c50,0.5):>10}f  {max(c90):>10}f"
-              f"   {ms:>6.1f} ms{flag}")
+        if max(c10) >= CAP_DEEP_F:
+            flag += "  <-- CAPTURE DEEP"
+            cap_ok = False
+        if rdy and max(rdy) >= READY_HIGH_F:
+            flag += "  <-- FIFO HIGH"
+            ready_ok = False
+        print(f"{src:<9}{len(w):>7}{st:>7}  "
+              f"{min(c10):>8}/{med10:>8}/{max(c10):>8}f{cms:>7.1f}   "
+              + (f"{min(rdy):>8}/{rmed:>8}/{max(rdy):>8}f{rms:>7.1f}" if rdy else f"{'-':>32}")
+              + flag)
 
     resets = [r for r in rows if r[3] == "reset" and r[4]]
     if resets:
@@ -228,13 +257,18 @@ def do_report(hours):
               f" windows each" + (f"; thin so far: {', '.join(thin)}" if thin else "")
               + ".\n         @usb matters most: isochronous, granted 170/2720, and the arm"
                 " exposed to the rail.")
-    elif verdict_ok:
+    elif cap_ok and ready_ok:
         print(f"verdict: {len(per_src)} sources, all keeping the capture trough under two"
-              " periods. The race reset's skip of this compartment stays negligible;"
-              " no capture-side clear is warranted.")
+              " periods and the FIFO trough under twice setpoint. The race reset's skip of the"
+              " capture ring stays negligible; no capture-side clear is warranted.")
     else:
-        print("verdict: A SOURCE IS HOLDING A DEEP CAPTURE TROUGH (flagged above)."
-              " Re-open B1 — check that source against the under-voltage column first.")
+        if not cap_ok:
+            print("<4>verdict: A SOURCE IS HOLDING A DEEP CAPTURE TROUGH (flagged above)."
+                  " Re-open B1 — check that source against the under-voltage column first.")
+        if not ready_ok:
+            print("<4>verdict: A SOURCE'S FIFO TROUGH IS ABOVE TWICE SETPOINT — the drift"
+                  " regulator is not holding on it. That is the ratchet fault, not a capture"
+                  " question; see the READY_BAND block in ardftsrc-bridge-rs/src/main.rs.")
     print()
 
 
@@ -242,9 +276,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--collect", action="store_true")
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--daily", action="store_true",
+                    help="collect, then summarise the last 24 h (the daily timer's mode)")
     ap.add_argument("--hours", type=float, default=0)
     a = ap.parse_args()
-    if a.collect:
+    if a.collect or a.daily:
         do_collect()
-    if a.report or not a.collect:
+    if a.daily:
+        do_report(24)
+    elif a.report or not a.collect:
         do_report(a.hours)

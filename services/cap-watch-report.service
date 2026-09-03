@@ -1,0 +1,20 @@
+[Unit]
+# INVESTIGATION SCAFFOLDING — pairs with cap-watch.timer. See tools/cap_watch.py.
+# Runs the 24 h summary once a day so the answer is waiting in the journal whether or not
+# anyone is looking. Routine output lands at info; anomalies are `<4>`-prefixed by the script
+# so journald files them at WARNING.
+#   journalctl -u cap-watch-report -p warning     -> only the days something moved
+#   journalctl -u cap-watch-report -o cat | tail  -> the latest summary in full
+# REMOVE WITH THE COLLECTOR:
+#   sudo systemctl disable --now cap-watch.timer cap-watch-report.timer
+#   sudo rm /etc/systemd/system/cap-watch*.{timer,service} && sudo systemctl daemon-reload
+Description=Daily summary of ardftsrc capture-ring and FIFO trough depth
+After=cap-watch.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/vibesbox-src/tools/cap_watch.py --daily
+User=root
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=300
