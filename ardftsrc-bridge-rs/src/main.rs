@@ -194,20 +194,31 @@ const READY_HIST_BUCKETS: usize = 96; // 0..12288 frames (128 ms) — ~2x the wi
 // ⚠ INSTRUMENT ONLY. It feeds no decision and changes no behaviour, per the standing rule that
 // the instrument and the threshold move in separate steps.
 //
-// ✅ ANSWERED THE SAME DAY, @lyrion, 7 consecutive windows, pink noise at 44.1k:
-//     capp10/50/90 = 64/64/192 f = 1.5/1.5/4.4 ms
-//     race reset:    cap=NOT-CLEARED 94 f (2.1 ms)
-// ⇒ THE TROUGH IS ~1.5 ms, NOT THE 61.7-85.3 ms THE GRANT ALLOWS. The capture thread keeps up
-// completely; the ring holds well under one 256-frame period and never accumulates. So the
-// compartment the race reset skips is worth about a millisecond, and A CAPTURE-SIDE CLEAR IS NOT
-// WORTH WRITING — which is exactly why this instrument had to come first. Had the shed been
-// written on the capacity figure it would have been justified by a number 40x too large.
+// ✅✅ CLOSED 2026-09-04 — 76 h, 2018 windows, THREE sources, via tools/cap_watch.py:
 //
-// ⚠ MEASURED ON @lyrion ONLY, i.e. an snd-aloop writer that never misses. NOT yet read on @usb,
-// whose grant is different (170/2720 against the 256/4096 ask) and whose feed is isochronous —
-// and which is the arm that sits under the rail's under-voltage events. If any path ever shows a
-// capp10 materially above one period, this is the compartment to look at and the shed becomes
-// worth reconsidering.
+//   | source | windows | starts | capp10 min/med/max |
+//   |---|---|---|---|
+//   | @tv     | 1226 | 18 | 64 / 64 / 64 f |
+//   | @usb    |  700 | 11 | 64 / 64 / 64 f |
+//   | @lyrion |   92 | 16 | 64 / 64 / 64 f |
+//
+// ⇒ THE TROUGH IS 64 f = 1.5 ms, NOT THE 61.7-85.3 ms THE GRANT ALLOWS — and min == med == max
+// on every path, i.e. NOT ONE WINDOW in 76 hours ever went above it. The capture thread keeps up
+// completely everywhere; the ring holds a quarter of one 256-frame period and never accumulates.
+// So the compartment the race reset deliberately skips is worth about a millisecond, and
+// A CAPTURE-SIDE CLEAR IS NOT WORTH WRITING.
+//
+// ⛔ THIS IS THE CASE FOR INSTRUMENTING BEFORE SHEDDING, and it is why the first reading was NOT
+// treated as the answer. Written on the GRANT the shed would have been justified by a number 40x
+// too large — the same capacity-vs-occupancy error as §5b's amplitude-vs-pedestal. And the first
+// reading was one source over 70 s: right, but not yet knowable.
+//
+// ⚠ The two arms that could have overturned it did not. @usb is isochronous, is granted 170/2720
+// rather than the 256/4096 asked, and is the arm exposed to the rail's under-voltage events
+// (930 in the same 76 h, 12.2/h; 8 of 45 bridge starts within 10 s of one) — it reads identically.
+// @tv is an I2S slave clocked by the TV — also identical.
+// ⌀ Still unread: @airplay and @tidal. If either ever shows a capp10 materially above one period,
+// this is the compartment to look at and the shed becomes worth reconsidering.
 //
 // In INPUT frames at `rate`, because that is what `pcm.delay()` counts on the capture side.
 const CAP_HIST_UNIT: usize = 128;    // 2.9 ms @44.1k — same resolution as the ring's
@@ -240,6 +251,10 @@ const CAP_HIST_BUCKETS: usize = 40;  // 0..5120 frames — clears the widest gra
 // @tv instance, 2026-08-29, no restart: `readyp10` FALLS 832 -> 64 f and pins at the bottom bucket
 // for the final 18 min; 0 regulator actions, 0 underruns, 0 xruns. This regulator is therefore
 // correctly and permanently INERT on @tv, which never rises above setpoint.
+// ★ CORROBORATED at scale 2026-09-04 (cap_watch, 76 h): over 1226 windows and 18 separate @tv
+// starts, `readyp10` reads 64/64/320 f — pinned at the bottom, exactly as the 27-minute run
+// predicted — against @usb's and @lyrion's 832/1088/1344 f around the 1024 f setpoint. The split
+// is by SOURCE and it is stable across days and restarts, not an artifact of one instance.
 //
 // ⇒ DIRECTION ALONE decides which symptom you get: over-production has nowhere to go downstream
 // (PipeWire will not consume faster than the graph rate) so it backs up into `ready` = a ratchet;
