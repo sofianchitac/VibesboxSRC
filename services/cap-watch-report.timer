@@ -1,9 +1,0 @@
-[Unit]
-Description=Daily ardftsrc trough-depth summary
-[Timer]
-# Early morning, after a normal evening of listening has been collected.
-OnCalendar=*-*-* 07:30:00
-Persistent=true
-RandomizedDelaySec=10min
-[Install]
-WantedBy=timers.target

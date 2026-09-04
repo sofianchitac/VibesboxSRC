@@ -16,14 +16,28 @@ reach.
 ⛔ READ-ONLY AND OFF THE AUDIO PATH. It parses log lines already being written and never
 touches a device, a service or the graph. Safe to run at any time, including mid-listening.
 
-  cap_watch.py --collect            append new samples (cap-watch.timer, every 10 min)
+  cap_watch.py --collect            append new samples from the journal
   cap_watch.py --report             summarise everything collected so far
   cap_watch.py --report --hours 24  summarise a trailing window
-  cap_watch.py --daily              the 24 h summary cap-watch-report.timer logs once a day
+  cap_watch.py --daily              collect, then summarise the last 24 h
 
-⌀ Anomaly lines are prefixed `<4>` so journald records them at WARNING while the routine
-summary stays at info — `journalctl -u cap-watch-report -p warning` is then exactly the list
-of days something moved, with no parsing.
+★ IT ANSWERED, AND ITS TIMERS ARE GONE. 2026-09-04, 76 h, 2018 windows, three sources —
+@tv 1226 / @usb 700 / @lyrion 92 — `capp10` min == med == max == **64 f (1.5 ms)** on every
+one of them, against a grant of 2720 f (usb) / 4096 f (lyrion, tv). Not one window went higher.
+⇒ The capture ring never accumulates on any path, so the race reset's deliberate skip of it
+costs about a millisecond. **Never write a capture-side clear.**
+Coverage is complete BY KIND: the three capture kinds on this box — isochronous USB gadget,
+I2S slave, snd-aloop — all read identically, so @airplay and @tidal add nothing.
+★ Free second result: @tv's `readyp10` pins at 64 f across 1226 windows and 18 starts while
+@usb/@lyrion sit at 1088 f near the 1024 f setpoint — the drift regulator being permanently
+inert on @tv (eARC runs -27.39 ppm, opposite sign to USB's +11.53), now shown stable across
+days and restarts rather than within one 27-minute instance.
+
+⌀ `cap-watch.timer` and `cap-watch-report.timer` were removed on 2026-09-04 with the question
+they were built for. THIS TOOL IS KEPT and stays runnable by hand — `--report` reads the
+retained TSV, `--collect` resumes from wherever it left off. Re-add a timer only if something
+reopens the question. Anomaly lines still carry a `<4>` prefix so journald would file them at
+WARNING if this is ever run from a unit again.
 
 Two statistics are watched, and they answer DIFFERENT questions. `capp10` is the capture
 ring's trough — the compartment the race reset walks past — and a deep one re-opens B1.
