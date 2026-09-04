@@ -239,8 +239,16 @@ def do_report(hours):
     # ⛔ DELIBERATELY HARD TO SATISFY. The whole reason this collector exists is that the
     # capture question was answered from ONE source over ~70 s, and this project's recurring
     # failure is a conclusion drawn from too little. So: no verdict until at least two sources
-    # have been seen and each has enough windows to be more than a warm-up transient. A blank
+    # have been seen WITH ENOUGH WINDOWS EACH to be more than a warm-up transient. A blank
     # "not yet" is the correct output for a watch that has not run long enough.
+    #
+    # ⛔ The bar counts QUALIFYING sources; a thin one does not veto. That is a fix, not a
+    # relaxation, and it was a real bug: the first version required EVERY seen source to clear
+    # 180 windows, so `@lyrion` at 92 held the verdict at NOT YET CONCLUSIVE while `@usb` (700)
+    # and `@tv` (1226) had both long since cleared it and agreed exactly. Under that rule one
+    # brief appearance of any source would suppress the answer indefinitely — a watch that can
+    # never conclude is worse than no watch. Thin sources are still LISTED, and still excluded
+    # from the count, so the bar itself is unchanged.
     MIN_SOURCES, MIN_WINDOWS = 2, 180   # 180 windows = ~30 min of bridge uptime per source
     per_src = {}
     for src in SOURCES:
@@ -248,19 +256,23 @@ def do_report(hours):
         if n:
             per_src[src] = n
     missing = [s for s in SOURCES if s not in per_src]
-    thin = [f"{s}({per_src[s]})" for s in per_src if per_src[s] < MIN_WINDOWS]
+    qualify = sorted(s for s in per_src if per_src[s] >= MIN_WINDOWS)
+    thin = [f"{s}({per_src[s]})" for s in sorted(per_src) if per_src[s] < MIN_WINDOWS]
     print(f"\nsources covered: {', '.join(f'{s}({n})' for s, n in sorted(per_src.items())) or 'none'}"
           + (f"   STILL MISSING: {', '.join(missing)}" if missing else "   (all)"))
+    if thin:
+        print(f"  thin, not weighed: {', '.join(thin)}   (need >={MIN_WINDOWS} windows)")
 
-    if len(per_src) < MIN_SOURCES or thin:
-        print(f"verdict: NOT YET CONCLUSIVE — need >={MIN_SOURCES} sources with >={MIN_WINDOWS}"
-              f" windows each" + (f"; thin so far: {', '.join(thin)}" if thin else "")
-              + ".\n         @usb matters most: isochronous, granted 170/2720, and the arm"
-                " exposed to the rail.")
+    if len(qualify) < MIN_SOURCES:
+        print(f"verdict: NOT YET CONCLUSIVE — {len(qualify)} of {MIN_SOURCES} sources have"
+              f" >={MIN_WINDOWS} windows."
+              "\n         @usb matters most: isochronous, granted 170/2720, and the arm"
+              " exposed to the rail.")
     elif cap_ok and ready_ok:
-        print(f"verdict: {len(per_src)} sources, all keeping the capture trough under two"
-              " periods and the FIFO trough under twice setpoint. The race reset's skip of the"
-              " capture ring stays negligible; no capture-side clear is warranted.")
+        print(f"verdict: {len(qualify)} sources qualify ({', '.join(qualify)}), all keeping the"
+              " capture trough under two periods and the FIFO trough under twice setpoint."
+              "\n         The race reset's skip of the capture ring stays negligible;"
+              " no capture-side clear is warranted.")
     else:
         if not cap_ok:
             print("<4>verdict: A SOURCE IS HOLDING A DEEP CAPTURE TROUGH (flagged above)."
