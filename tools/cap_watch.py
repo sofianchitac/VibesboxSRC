@@ -269,11 +269,18 @@ def do_report(hours):
         n = len([r for r in rows if r[2] == src and r[3] == "window" and r[4]])
         if n:
             per_src[src] = n
+    # ⌀ A source absent by NAME is not a gap in coverage. This box has three capture KINDS —
+    # isochronous USB gadget (@usb), I2S slave (@tv), snd-aloop (@lyrion/@airplay/@tidal) — and
+    # the reading is a property of the kind, not the name. @airplay and @tidal are snd-aloop
+    # readers structurally identical to @lyrion, so they add nothing. Listed, not chased.
     missing = [s for s in SOURCES if s not in per_src]
     qualify = sorted(s for s in per_src if per_src[s] >= MIN_WINDOWS)
     thin = [f"{s}({per_src[s]})" for s in sorted(per_src) if per_src[s] < MIN_WINDOWS]
     print(f"\nsources covered: {', '.join(f'{s}({n})' for s, n in sorted(per_src.items())) or 'none'}"
-          + (f"   STILL MISSING: {', '.join(missing)}" if missing else "   (all)"))
+          + (f"   unseen: {', '.join(missing)}" if missing else "   (all)"))
+    if missing:
+        print("  ⌀ unseen != uncovered — all three capture KINDS (usb gadget, I2S slave,"
+              " snd-aloop) are represented above.")
     if thin:
         print(f"  thin, not weighed: {', '.join(thin)}   (need >={MIN_WINDOWS} windows)")
 

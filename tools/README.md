@@ -2,6 +2,7 @@
 
 One-shot instruments, not part of the running system. Nothing here is installed by
 `install.sh` or referenced by any service; copy a script to the Pi when you need it.
+(`deploy.sh` does sync this directory to `/opt`, so a tool is runnable there without copying.)
 
 They exist because the eARC path has almost no observability by default. The capture card
 is always enumerated whether the TV is on or off, slave-mode I2S has no rate autodetect,
@@ -39,6 +40,23 @@ the bridge starts.
 **`earc_latency_marker.py`** measures end-to-end decode latency with the decoder as the
 only variable. This is what established that GStreamer holds one fewer decode frame than
 ffmpeg on DD+ (~22 ms).
+
+## Buffer occupancy
+
+**`cap_watch.py`** collects the ardftsrc bridge's own `capp10/50/90` (the ALSA capture ring's
+trough), `readyp10` (the resampler FIFO's trough), bridge starts and kernel under-voltage
+events into one time-aligned TSV. It exists because journald on this box keeps only about two
+days, so a multi-day question cannot be answered by reading the journal at the end.
+
+It settled one: over 76 h and 2018 windows across `@tv`, `@usb` and `@lyrion`, `capp10` is
+64 f (1.5 ms) with min == med == max — not one window higher, against a granted buffer of
+2720–4096 f. The capture ring never accumulates, so the race reset's deliberate skip of it
+costs about a millisecond. Its collection timers were removed with the question on
+2026-09-04; run it by hand (`--report` reads the retained TSV).
+
+> ⚠ Its verdict is gated at two sources × 180 windows and counts *qualifying* sources. An
+> earlier version required every source it had ever seen to clear the bar, which let one brief
+> appearance suppress the answer indefinitely.
 
 ## Decoder comparison
 
