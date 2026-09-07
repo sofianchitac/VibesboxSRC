@@ -970,15 +970,20 @@ fn main() {
         .and_then(|p| p.get_period_size())
         .map(|v| v.max(1) as usize)
         .unwrap_or(OUT_PERIOD as usize);
-    // ── Link-wait side-channel (2026-09-07) ────────────────────────────────────────────
+    // ── Time-to-first-block side-channel (2026-09-07) ──────────────────────────────────
     // The `pipewire` ALSA plugin creates the pw_stream at open/prepare, so the graph node
-    // `source.<name>.ardftsrc` exists from HERE — but nothing consumes it until
-    // `source_router.reconcile()` authors the pw-link, and reconcile runs on a 2 Hz poll
-    // (`POLL_INTERVAL = 0.5`) whose first pass happens BEFORE this process has booted. The
-    // gap between this instant and the first `writei` that returns is therefore the unlinked
-    // wait, quantised by that poll — the one per-start phase term the bridge has never
-    // recorded. `t_start` below is NOT a substitute: it is taken after rate detection (up to
-    // 10 s), the resampler build and the thread spawns, so it cannot isolate this.
+    // `source.<name>.ardftsrc` exists from HERE. The elapsed time to the first `writei` that
+    // returns is the first block's transit through the output PCM — measured 108/110 ms on
+    // @lyrion and 119 ms on @usb, i.e. essentially deterministic across sources and starts.
+    //
+    // ⛔ It is NOT a wait for the pw-link, and the field it prints is named `link_wait` from
+    // when it was believed to be one. `writei` into an unlinked node SUCCEEDS — PipeWire runs
+    // the node against Dummy-Driver and the output goes nowhere — so this never blocks on a
+    // consumer. The link is timed on the source_router side instead (`linked <node>: N
+    // port(s).`), which is the only honest source for it.
+    //
+    // `t_start` below is NOT a substitute for this: it is taken after rate detection (up to
+    // 10 s), the resampler build and the thread spawns, so it cannot isolate the output PCM.
     let t_out_open = Instant::now();
     // Smallest write worth waking for: half a granted period. Below this the loop would spin on
     // partial writes that barely shorten the queue, and each pass still costs an `avail_update`.

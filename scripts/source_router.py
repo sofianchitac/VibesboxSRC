@@ -1025,14 +1025,27 @@ class SourceRouter:
             for (o, i) in current - desired:
                 self._pw_unlink(o, i)
 
-            # ★ 2026-09-07: timestamp the moment a node actually gains its links.
-            # Measured that day on two @lyrion starts, the ardftsrc bridge's race reset
-            # fires 463-494 ms BEFORE this point: `writei` into an unlinked PipeWire node
-            # SUCCEEDS (the node runs against Dummy-Driver and the output goes nowhere), so
-            # the reset's `out_frames_written > 2 * OUT_BUFFER` test proves nothing about a
-            # consumer existing. That gap was inferred from the "<source>: active" state
-            # line, which is a different event — reconcile links on node appearance, not on
-            # run state — so it was an estimate, not a measurement. This makes it one.
+            # ★ 2026-09-07: timestamp the moment a node actually gains its links. This
+            # line exists because the only other candidate — the "<source>: active" state
+            # log — is NOT the link event and is badly late: measured on the @usb start at
+            # 18:00:45.910 vs "active" at 18:00:46.504, it trails the real link by 595 ms.
+            # Anything reasoned from `active` as a link proxy is wrong by about that much.
+            #
+            # What the one measured start shows: bridge exec 44.644, output node created
+            # 45.875, LINK 45.910 (35 ms later), first write 45.992, race reset 46.032. So
+            # reconcile can land almost immediately after the node appears — but it is a 2 Hz
+            # poll that is not phased to the bridge, so the delay is a per-start draw from
+            # roughly [0, POLL_INTERVAL].
+            #
+            # ⚠ That makes the ORDER of the link and the bridge's race reset a per-start
+            # lottery. The reset fires ~157 ms after node creation (~117 ms to first write,
+            # ~40 ms more to cross `out_frames_written > 2 * OUT_BUFFER`), so a link drawn
+            # earlier than that gives a valid reset and a later one gives a reset with no
+            # consumer attached — `writei` into an unlinked node SUCCEEDS, the node runs
+            # against Dummy-Driver and its output goes nowhere, so the trigger cannot tell
+            # the two apart. n=1 measured here; treat the ordering as unresolved, not as a
+            # known defect, until more starts are logged.
+            #
             # Quiet by construction: only fires when the link set actually changes, i.e. at
             # a source start/stop, not on the 2 Hz steady-state pass.
             if added:
