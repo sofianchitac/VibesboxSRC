@@ -759,7 +759,18 @@ class SourceRouter:
                     proc.kill()
                 except ProcessLookupError:
                     pass
-            logging.debug(f"TV: eARC probe found nothing ({exc}).")
+            # ★ 2026-09-07: WARNING, not debug. This line is the ONLY witness to the probe
+            # failing, and one of its documented causes is the exclusive `hw:eARC,0` being
+            # held by a bridge that is still tearing down — i.e. probe/bridge contention,
+            # a candidate for the large unexplained bitstream outliers (ledger §7.14).
+            # At debug it was discarded before reaching the journal (basicConfig is INFO),
+            # so a 1.5-day search for contention returned a meaningless zero: the
+            # instrument was off, not the mechanism absent.
+            # ⌀ Rate: the probe only runs while NO TV bridge holds the device, every
+            # EARC_PROBE_INTERVAL, and "found nothing" is the NORMAL steady state whenever
+            # the TV is simply off — so expect this to be chatty on an idle box. That is
+            # the cost of having a witness; `exc` distinguishes a busy device from silence.
+            logging.warning(f"TV: eARC probe found nothing ({exc}).")
             return None, None
         # Time ONLY the bytes delivered after the first chunk. Timing from the spawn
         # instead charged fork/exec + ALSA open + the driver's first period against a
