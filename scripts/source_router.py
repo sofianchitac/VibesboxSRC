@@ -1019,10 +1019,30 @@ class SourceRouter:
             # ── apply the diff (only over managed output nodes) ──────────────
             current = {(o, i) for (o, i) in links
                        if port_node.get(o) in managed_out_nodes}
-            for (o, i) in desired - current:
+            added = desired - current
+            for (o, i) in added:
                 self._pw_link(o, i)
             for (o, i) in current - desired:
                 self._pw_unlink(o, i)
+
+            # ★ 2026-09-07: timestamp the moment a node actually gains its links.
+            # Measured that day on two @lyrion starts, the ardftsrc bridge's race reset
+            # fires 463-494 ms BEFORE this point: `writei` into an unlinked PipeWire node
+            # SUCCEEDS (the node runs against Dummy-Driver and the output goes nowhere), so
+            # the reset's `out_frames_written > 2 * OUT_BUFFER` test proves nothing about a
+            # consumer existing. That gap was inferred from the "<source>: active" state
+            # line, which is a different event — reconcile links on node appearance, not on
+            # run state — so it was an estimate, not a measurement. This makes it one.
+            # Quiet by construction: only fires when the link set actually changes, i.e. at
+            # a source start/stop, not on the 2 Hz steady-state pass.
+            if added:
+                id_name = {nid: nm for nm, nid in names.items()}
+                per_node = {}
+                for (o, _i) in added:
+                    nid = port_node.get(o)
+                    per_node[nid] = per_node.get(nid, 0) + 1
+                for nid, n in per_node.items():
+                    logging.info(f"linked {id_name.get(nid, f'node {nid}')}: {n} port(s).")
 
             # ── Bluetooth telemetry (PW-native source, derived from the dump) ────
             # The ardftsrc sources get their native rate from the ALSA layer in
