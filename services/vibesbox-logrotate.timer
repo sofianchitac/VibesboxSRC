@@ -1,0 +1,15 @@
+[Unit]
+Description=Hourly rotation for the Vibesbox CamillaDSP log
+
+# ⚠ HOURLY, not daily. The stock logrotate.timer runs once a day; at the GB/day rate this
+# log was measured growing on 2026-09-07 that lets it reach ~GB between runs, which is both
+# a disk risk and an expensive `copytruncate` when it finally fires. Hourly keeps each copy
+# small. If the underlying frame-drop spam is ever fixed, this timer becomes unnecessary and
+# the config can fall back to the system schedule.
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

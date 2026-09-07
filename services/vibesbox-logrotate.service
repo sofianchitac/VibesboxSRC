@@ -1,0 +1,10 @@
+[Unit]
+Description=Rotate the Vibesbox CamillaDSP log
+Documentation=file:///opt/vibesbox-src/config/logrotate/vibesbox-camilladsp
+
+[Service]
+Type=oneshot
+# Only this config, not the system set — the system's own logrotate.timer still owns
+# everything else on its daily schedule. `-s` keeps a separate state file so the two
+# never fight over each other's rotation bookkeeping.
+ExecStart=/usr/sbin/logrotate -s /var/lib/logrotate/vibesbox.status /etc/logrotate.d/vibesbox-camilladsp

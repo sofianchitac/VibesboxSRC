@@ -648,11 +648,23 @@ SERVICES=(
     lattepanda-watcher.service
     lattepanda-watcher.timer
     tidal-connect.service
+    vibesbox-logrotate.service
+    vibesbox-logrotate.timer
 )
 
 for svc in "${SERVICES[@]}"; do
     cp "$INSTALL_DIR/services/$svc" /etc/systemd/system/
 done
+
+# CamillaDSP's log is unbounded by default — measured at 10 GB (~35% of the card) on
+# 2026-09-07, grown in ~1.5 days. ⛔ The size is a SYMPTOM of continuous "Capture:
+# processing pipeline full, dropping frame" warnings; rotating bounds the disk, it does
+# not fix the drops. The hourly timer above exists because the stock daily logrotate is
+# far too slow at that growth rate — see the config's header.
+mkdir -p /etc/logrotate.d
+cp "$INSTALL_DIR/config/logrotate/vibesbox-camilladsp" /etc/logrotate.d/vibesbox-camilladsp
+chmod 644 /etc/logrotate.d/vibesbox-camilladsp
+
 systemctl daemon-reload
 step_ok "Systemd services installed"
 
@@ -661,6 +673,7 @@ step_ok "Systemd services installed"
 # ─────────────────────────────────────────────
 echo "[12/13] Enabling services…"
 systemctl enable \
+    vibesbox-logrotate.timer \
     pipewire.service \
     wireplumber.service \
     source-router.service \

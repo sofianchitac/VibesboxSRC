@@ -1,0 +1,27 @@
+# CamillaDSP's log (camilladsp.service passes `-o /opt/vibesbox-src/state/camilladsp.log`).
+#
+# ⚠ WHY THIS EXISTS: found 2026-09-07 at 10 GB — ~35 % of the 29 GB card — having grown since
+# the Sep 6 boot, i.e. on the order of GB/day. Nothing had ever read it, and nothing bounded it.
+#
+# ⛔ THE SIZE IS A SYMPTOM, NOT THE FAULT. The volume is repeated
+#   `WARN [camillalib::pipewire_backend::device] Capture: processing pipeline full, dropping frame`
+# — CamillaDSP discarding capture frames, mid-chain, continuously. Rotating it bounds the disk
+# and DOES NOT fix that. Do not treat this file as having closed the issue.
+#
+# `copytruncate` is mandatory: camilladsp holds the fd from `-o` open for the life of the
+# process and does not reopen on signal, so a plain rename leaves it writing to an unlinked
+# inode and the disk never comes back.
+#
+# ⚠ `copytruncate` COPIES the live file, so the rotation threshold is also the copy cost on an
+# SD card. 20M keeps each copy cheap; the trade is that at a GB/day drop rate the daily
+# logrotate timer is far too slow, hence the hourly override installed alongside this.
+/opt/vibesbox-src/state/camilladsp.log {
+    size 20M
+    rotate 3
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+    su root root
+}

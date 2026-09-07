@@ -23,7 +23,20 @@ devices:
     node_description: "Vibesbox DSP input (8ch sum point)"
     node_group_name: vibesbox-dsp   # shared driver/clock with playback (clock coherence)
     autoconnect_to: null            # source_router.py is the sole routing authority
-  capture_samplerate: 96000
+  # ⛔ `capture_samplerate` and a `resampler:` block were BOTH removed 2026-09-07. With
+  # capture and playback identical at 96 kHz and `enable_rate_adjust: false`, they made
+  # CamillaDSP instantiate a Synchronous (FFT) resampler at a 1:1 ratio — and it said so
+  # itself, once per start, into a log nobody was reading:
+  #   WARN [camillalib::audiodevice] Needless 1:1 sample rate conversion active.
+  #                                  Not needed since enable_rate_adjust=False
+  # "Active", not bypassed. That is a redundant SRC stage sitting in the middle of a chain
+  # whose whole ethos is that ARDFTSRC owns resampling and nothing else touches it.
+  #
+  # ⌀ Why it was ever here: vestigial. In v1 CamillaDSP DID the source-native -> 96 kHz
+  # conversion, so a capture rate and a resampler were load-bearing. That job moved to the
+  # per-source ardftsrc bridges; the fields stayed. The file is a full serde dump (every
+  # optional field written out as `null`), so they were carried by the serializer rather
+  # than by a decision.
   chunksize: 512  # = PipeWire quantum; matches PERIOD_FRAMES in ndi_transmitter.py
   enable_rate_adjust: false   # PipeWire owns the clock/drift
   multithreaded: null
@@ -36,8 +49,7 @@ devices:
     autoconnect_to: null            # daemon links dsp-out -> ndi-tx-in
   queuelimit: null
   rate_measure_interval: null
-  resampler:
-    type: Synchronous
+  resampler: null   # see the note above capture_samplerate — was a 1:1 FFT no-op
   samplerate: 96000
   silence_threshold: null
   silence_timeout: null

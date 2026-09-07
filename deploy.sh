@@ -134,6 +134,13 @@ cp "$INSTALL_DIR"/config/wireplumber/wireplumber.conf.d/*.conf /etc/wireplumber/
 # nowplaying.env.example) are deliberately NOT systemd units and must not go here.
 cp "$INSTALL_DIR"/services/*.service /etc/systemd/system/
 cp "$INSTALL_DIR"/services/*.timer   /etc/systemd/system/ 2>/dev/null
+# CamillaDSP's log is unbounded by default — measured at 10 GB (~35% of the card) on
+# 2026-09-07, grown in ~1.5 days. See the config's own header: the size is a SYMPTOM of
+# continuous "Capture: processing pipeline full, dropping frame" warnings, and rotating
+# it bounds the disk without fixing that.
+mkdir -p /etc/logrotate.d
+cp "$INSTALL_DIR/config/logrotate/vibesbox-camilladsp" /etc/logrotate.d/vibesbox-camilladsp
+chmod 644 /etc/logrotate.d/vibesbox-camilladsp
 # Source daemon configs that live outside /opt.
 cp "$INSTALL_DIR/services/squeezelite.conf"    /etc/default/squeezelite
 cp "$INSTALL_DIR/services/shairport-sync.conf" /etc/shairport-sync.conf
