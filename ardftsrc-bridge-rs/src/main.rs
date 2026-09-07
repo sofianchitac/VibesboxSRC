@@ -784,32 +784,34 @@ fn i32_to_f64(s: i32) -> f64 {
     s as f64 / 2_147_483_648.0 // 2^31
 }
 
-// Intersample headroom, applied BEFORE the clamp below. Upsampling reconstructs the true
-// peaks a loud/limited master hides between its samples, so ardftsrc output routinely
-// exceeds ±1.0 on such material — and this i32 conversion is the ONLY integer stage in the
-// chain (everything after it is F32: PipeWire sum bus, CamillaDSP, NDI). Clipping here is
-// unrecoverable. 2026-07-29: moved here from the CamillaDSP `intersample_headroom` filter in
-// dsp_6ch.yml, which sat DOWNSTREAM of this node and so attenuated already-clipped audio.
-// End-to-end level is UNCHANGED: gain is linear and PipeWire's sum is linear, so -4 dB
-// per-source pre-sum equals the -4 dB post-sum it replaces.
-const HEADROOM: f64 = 0.630_957_344_480_193_4; // 10^(-4/20) = -4.0 dB
+// ⛔ NO GAIN HERE. The intersample headroom this bridge used to apply now lives on the
+// REAPER track the NDI receive plugin sits on (2026-09-07), applied ONCE for the whole
+// chain rather than once per source. `scripts/earc-bitstream-bridge.sh` lost its matching
+// -4 dB in the same change — the two were level-matched by construction, and removing one
+// alone would have shifted LPCM against bitstream.
+//
+// This bridge is now unity, and since the output is F32 (see `f64_to_f32`) the intersample
+// peaks ardftsrc reconstructs above full scale travel to REAPER intact. That is the point:
+// the gain used to sit in front of the chain's only integer stage, so any peak it did not
+// duck was clipped here, unrecoverably.
+//
+// ⚠ Do not reintroduce a gain here without removing the REAPER one in the same change.
+// Same rule the bitstream arm carries, for the same reason.
 
 /// Finiteness guard, NOT a level control. Its only job is to stop a pathological sample
 /// reaching the graph as `inf`: `f64` holds ~1e308 happily, but the `as f32` narrowing below
 /// turns anything past ~3.4e38 into `inf`, and an `inf` propagates into the LattePanda's IIR
-/// state (Dirac, Penteo) where a click would not. Real audio cannot approach it — after the
-/// -4 dB `HEADROOM` a source would have to run +16 dBFS to reach ±4.0 — so unlike the ±1.0 it
-/// replaces it never touches the signal.
+/// state (Dirac, Penteo) where a click would not. Real audio cannot approach ±4.0: it is
+/// +12 dBFS, against the +1.68 dBFS worst case ever measured on this chain. So unlike the
+/// ±1.0 it replaces, it never touches the signal.
 const SAFETY_CEIL: f64 = 4.0;
 
 /// f64 -> F32LE for the `pipewire` playback PCM.
 ///
-/// ⚠ NOT a level change: `HEADROOM` is applied exactly as before, so the wire level is
-/// identical to the S32 path this replaces. What goes away is the ±1.0 clamp. Upsampling
-/// reconstructs intersample peaks above full scale on loud masters, and this was the ONLY
-/// integer stage in the chain — everything downstream (PipeWire sum bus, CamillaDSP, NDI
-/// FLTP, REAPER) is float — so those peaks were being flattened here, unrecoverably, for no
-/// reason the rest of the chain needed.
+/// Unity: everything downstream (PipeWire sum bus, CamillaDSP, NDI FLTP, REAPER) is float,
+/// so the intersample peaks ardftsrc reconstructs above full scale now reach REAPER intact
+/// instead of meeting an integer stage and a ±1.0 clamp here. The headroom that used to
+/// duck them lives on the REAPER receive track — see the note above `SAFETY_CEIL`.
 ///
 /// ⛔ The bound stays, retargeted. `ardftsrc` 0.0.16 fixed a divergence on
 /// `synthesize_start_context` — a path this bridge runs on EVERY start — that produced
@@ -818,8 +820,7 @@ const SAFETY_CEIL: f64 = 4.0;
 /// would emit `inf` instead. NaN is handled first because `f64::clamp` propagates it.
 #[inline]
 fn f64_to_f32(x: f64) -> f32 {
-    let y = x * HEADROOM;
-    if y.is_nan() { 0.0 } else { y.clamp(-SAFETY_CEIL, SAFETY_CEIL) as f32 }
+    if x.is_nan() { 0.0 } else { x.clamp(-SAFETY_CEIL, SAFETY_CEIL) as f32 }
 }
 
 /// Default RT priority for the CAPTURE THREAD ONLY. 0 disables; override with

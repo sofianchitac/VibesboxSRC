@@ -159,31 +159,29 @@ case "$FORMAT" in
     dts)  GST_PARSE=dcaparse; GST_DEC=avdec_dca  ;;
 esac
 
-# OUTPUT HEADROOM. AC-3/E-AC-3 decode of loud content runs past 0 dBFS. Measured
-# 2026-08-02 on live DD+ — on the GST arm, i.e. WITH libavcodec's default DRC applied —
-# at up to +1.68 dBFS, with 5 of 6 channels over full scale on ~80% of the receiver's
-# telemetry samples (peak per channel: +1.32 +1.13 +1.68 +1.35 +0.38 +1.37 dB). Every
-# stage from here to the RME is float so nothing clips in transit, but REAPER mutes a
-# track for protection when it goes far enough over, which is what actually bit. -4 dB
-# matches the headroom the ardftsrc bridges already carry for the same reason (20113ae).
-# Applies to ac3/dts as well: same decode path, and a per-codec gain would put the TV
-# source at a different level depending on what the broadcaster sent.
-# ⚠ The two arms MUST stay level-matched — -4 dB == 0.63096 linear. Change both or
-# neither, or flipping DECODER silently shifts the room calibration by 4 dB.
-HEADROOM_DB=-4
-HEADROOM_LIN=0.63096
+# ⛔ NO OUTPUT GAIN HERE. The headroom this path used to carry now lives on the REAPER
+# track the NDI receive plugin sits on (2026-09-07), applied ONCE for the whole chain
+# instead of once per source arm.
+#
+# What it was protecting is unchanged and still real: AC-3/E-AC-3 decode of loud content
+# runs past 0 dBFS — measured 2026-08-02 on live DD+ at up to +1.68 dBFS, 5 of 6 channels
+# over full scale on ~80% of the receiver's telemetry samples. Nothing clips in transit
+# (every stage from here to the RME is float); what bit was REAPER muting a track for
+# protection when it goes far enough over. That guard is now upstream of the mute, where
+# one setting covers LPCM and bitstream alike.
+#
+# ⚠ Do not reintroduce a gain here without removing the REAPER one in the same change.
+# This arm and the ardftsrc bridges were level-matched by construction, and the reason
+# both constants were deleted together is that a gain on one path only shifts the room
+# calibration by its own amount depending on what the TV happens to be sending.
 
 # The decoder stage, as a function so the pipeline below reads the same either way.
-# Both arms: elementary stream on stdin -> 6ch f32le 48k at -4 dB on stdout, nothing else.
+# Both arms: elementary stream on stdin -> 6ch f32le 48k at unity on stdout, nothing else.
 decode() {
     if [ "$DECODER" = "gst" ]; then
-        # volume sits AFTER the caps filter on purpose: downstream of audioconvert it
-        # cannot provoke the remap that note 2 above warns about, and it is caps-passthrough
-        # so the load-bearing 0xc0f survives it. Verified -4.00 dB on all 6 ch, 2026-08-02.
         exec gst-launch-1.0 -q \
             fdsrc fd=0 ! "$GST_PARSE" ! "$GST_DEC" ! audioconvert ! \
             "audio/x-raw,format=F32LE,layout=interleaved,channels=6,rate=48000,channel-mask=(bitmask)0xc0f" ! \
-            volume volume="$HEADROOM_LIN" ! \
             fdsink fd=1 sync=false
     fi
     # -ar pins the rate the way the gst arm's caps do: AC-3 cores can legally be
@@ -193,7 +191,6 @@ decode() {
     exec ffmpeg -hide_banner -nostats -loglevel warning -nostdin \
         -fflags nobuffer -flags low_delay -analyzeduration 100000 -probesize 32768 \
         -drc_scale 0 -f "$FORMAT" -i - \
-        -af "volume=${HEADROOM_DB}dB" \
         -ac 6 -ar 48000 -c:a pcm_f32le -f f32le -
 }
 
