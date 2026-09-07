@@ -503,7 +503,7 @@ impl RateChangeDebounce {
 /// the capture simply blocks). source_router only starts this bridge after a probe has
 /// already seen a clock.
 fn measure_rate(device: &str, channels: usize) -> Option<u32> {
-    let pcm = open_pcm(device, Direction::Capture, 48_000, channels as u32, CAP_PERIOD, CAP_BUFFER).ok()?;
+    let pcm = open_pcm(device, Direction::Capture, 48_000, channels as u32, CAP_PERIOD, CAP_BUFFER, Format::s32()).ok()?;
     let io = pcm.io_i32().ok()?;
     let mut buf = vec![0i32; CAP_PERIOD as usize * channels];
 
@@ -715,13 +715,18 @@ fn open_pcm(
     channels: u32,
     period: i64,
     buffer: i64,
+    format: Format,
 ) -> Result<PCM, alsa::Error> {
     let pcm = PCM::new(device, dir, false)?;
     {
         let hwp = HwParams::any(&pcm)?;
         hwp.set_channels(channels)?;
         hwp.set_rate(rate, ValueOr::Nearest)?;
-        hwp.set_format(Format::s32())?; // native-endian S32 == S32_LE on the Pi (ARM LE)
+        // Passed in per call, never defaulted: the capture side reads hardware, which is
+        // S32 (native-endian S32 == S32_LE on the Pi, ARM LE), while the `pipewire` playback
+        // side is F32 — see `f64_to_f32`. Keeping it a parameter means the format is visible
+        // at every open rather than hidden behind a shared default.
+        hwp.set_format(format)?;
         hwp.set_access(Access::RWInterleaved)?;
         let _ = hwp.set_buffer_size_near(buffer);
         let _ = hwp.set_period_size_near(period, ValueOr::Nearest);
@@ -789,9 +794,32 @@ fn i32_to_f64(s: i32) -> f64 {
 // per-source pre-sum equals the -4 dB post-sum it replaces.
 const HEADROOM: f64 = 0.630_957_344_480_193_4; // 10^(-4/20) = -4.0 dB
 
+/// Finiteness guard, NOT a level control. Its only job is to stop a pathological sample
+/// reaching the graph as `inf`: `f64` holds ~1e308 happily, but the `as f32` narrowing below
+/// turns anything past ~3.4e38 into `inf`, and an `inf` propagates into the LattePanda's IIR
+/// state (Dirac, Penteo) where a click would not. Real audio cannot approach it — after the
+/// -4 dB `HEADROOM` a source would have to run +16 dBFS to reach ±4.0 — so unlike the ±1.0 it
+/// replaces it never touches the signal.
+const SAFETY_CEIL: f64 = 4.0;
+
+/// f64 -> F32LE for the `pipewire` playback PCM.
+///
+/// ⚠ NOT a level change: `HEADROOM` is applied exactly as before, so the wire level is
+/// identical to the S32 path this replaces. What goes away is the ±1.0 clamp. Upsampling
+/// reconstructs intersample peaks above full scale on loud masters, and this was the ONLY
+/// integer stage in the chain — everything downstream (PipeWire sum bus, CamillaDSP, NDI
+/// FLTP, REAPER) is float — so those peaks were being flattened here, unrecoverably, for no
+/// reason the rest of the chain needed.
+///
+/// ⛔ The bound stays, retargeted. `ardftsrc` 0.0.16 fixed a divergence on
+/// `synthesize_start_context` — a path this bridge runs on EVERY start — that produced
+/// huge-but-FINITE values (~1e308) before anything became NaN. The old expression clamped
+/// those to 1.0 and emitted `i32::MAX`, i.e. a full-scale click; without a bound the f32 cast
+/// would emit `inf` instead. NaN is handled first because `f64::clamp` propagates it.
 #[inline]
-fn f64_to_i32(x: f64) -> i32 {
-    ((x * HEADROOM).clamp(-1.0, 1.0) * 2_147_483_647.0) as i32 // 2^31 - 1
+fn f64_to_f32(x: f64) -> f32 {
+    let y = x * HEADROOM;
+    if y.is_nan() { 0.0 } else { y.clamp(-SAFETY_CEIL, SAFETY_CEIL) as f32 }
 }
 
 /// Default RT priority for the CAPTURE THREAD ONLY. 0 disables; override with
@@ -847,7 +875,7 @@ fn set_capture_thread_fifo() -> i32 {
 }
 
 /// Write a full interleaved buffer, recovering from xruns, until all frames land.
-fn write_all(io: &IO<i32>, pcm: &PCM, buf: &[i32], channels: usize) -> Result<(), alsa::Error> {
+fn write_all(io: &IO<f32>, pcm: &PCM, buf: &[f32], channels: usize) -> Result<(), alsa::Error> {
     let total = buf.len() / channels;
     let mut done = 0usize;
     while done < total {
@@ -918,17 +946,17 @@ fn main() {
             cfg.name, channels, cfg.position
         ),
     );
-    let out_pcm = match open_pcm("pipewire", Direction::Playback, TARGET_RATE, channels as u32, OUT_PERIOD, OUT_BUFFER) {
+    let out_pcm = match open_pcm("pipewire", Direction::Playback, TARGET_RATE, channels as u32, OUT_PERIOD, OUT_BUFFER, Format::float()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("ardftsrc-bridge: failed to open 'pipewire' output PCM: {e}");
             std::process::exit(3);
         }
     };
-    let out_io = match out_pcm.io_i32() {
+    let out_io = match out_pcm.io_f32() {
         Ok(io) => io,
         Err(e) => {
-            eprintln!("ardftsrc-bridge: output io_i32 failed: {e}");
+            eprintln!("ardftsrc-bridge: output io_f32 failed: {e}");
             std::process::exit(3);
         }
     };
@@ -941,6 +969,16 @@ fn main() {
         .and_then(|p| p.get_period_size())
         .map(|v| v.max(1) as usize)
         .unwrap_or(OUT_PERIOD as usize);
+    // ── Link-wait side-channel (2026-09-07) ────────────────────────────────────────────
+    // The `pipewire` ALSA plugin creates the pw_stream at open/prepare, so the graph node
+    // `source.<name>.ardftsrc` exists from HERE — but nothing consumes it until
+    // `source_router.reconcile()` authors the pw-link, and reconcile runs on a 2 Hz poll
+    // (`POLL_INTERVAL = 0.5`) whose first pass happens BEFORE this process has booted. The
+    // gap between this instant and the first `writei` that returns is therefore the unlinked
+    // wait, quantised by that poll — the one per-start phase term the bridge has never
+    // recorded. `t_start` below is NOT a substitute: it is taken after rate detection (up to
+    // 10 s), the resampler build and the thread spawns, so it cannot isolate this.
+    let t_out_open = Instant::now();
     // Smallest write worth waking for: half a granted period. Below this the loop would spin on
     // partial writes that barely shorten the queue, and each pass still costs an `avail_update`.
     let min_out_write = (out_period_frames / 2).max(1);
@@ -1031,7 +1069,7 @@ fn main() {
             "ardftsrc-bridge: capture thread {}",
             if cap_prio > 0 { format!("SCHED_FIFO {cap_prio}") } else { "SCHED_OTHER".into() }
         );
-        let pcm = match open_pcm(&cap_device, Direction::Capture, rate, cap_channels as u32, CAP_PERIOD, CAP_BUFFER) {
+        let pcm = match open_pcm(&cap_device, Direction::Capture, rate, cap_channels as u32, CAP_PERIOD, CAP_BUFFER, Format::s32()) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("ardftsrc-bridge: failed to open capture {cap_device}: {e}");
@@ -1215,7 +1253,7 @@ fn main() {
     let mut in_buf = vec![0.0f64; pop_cap];
     let out_cap = out_period_frames * channels * 4;
     let mut out_f = vec![0.0f64; out_cap];
-    let mut out_i = vec![0i32; out_cap];
+    let mut out_s = vec![0.0f32; out_cap];
     // Partial-frame remainder, in case read_samples() ever returns a count that is not a
     // whole number of frames (writei needs whole frames). Normally stays empty.
     let mut frame_carry: Vec<f64> = Vec::with_capacity(channels);
@@ -1765,9 +1803,9 @@ fn main() {
             start = take;
             if frame_carry.len() == channels {
                 for (i, &x) in frame_carry.iter().enumerate() {
-                    out_i[i] = f64_to_i32(x);
+                    out_s[i] = f64_to_f32(x);
                 }
-                if let Err(e) = write_all(&out_io, &out_pcm, &out_i[..channels], channels) {
+                if let Err(e) = write_all(&out_io, &out_pcm, &out_s[..channels], channels) {
                     eprintln!("ardftsrc-bridge: output write failed: {e}");
                     running.store(false, Ordering::SeqCst);
                     break 'process;
@@ -1780,10 +1818,10 @@ fn main() {
         let body = &out_f[start..w];
         let whole = (body.len() / channels) * channels;
         for i in 0..whole {
-            out_i[i] = f64_to_i32(body[i]);
+            out_s[i] = f64_to_f32(body[i]);
         }
         if whole > 0 {
-            if let Err(e) = write_all(&out_io, &out_pcm, &out_i[..whole], channels) {
+            if let Err(e) = write_all(&out_io, &out_pcm, &out_s[..whole], channels) {
                 eprintln!("ardftsrc-bridge: output write failed: {e}");
                 running.store(false, Ordering::SeqCst);
                 break 'process;
@@ -1807,10 +1845,12 @@ fn main() {
         if wrote_any && !first_write_done {
             first_write_done = true;
             eprintln!(
-                "ardftsrc-bridge[diag startup]: first block written at +{:.0}ms after exec; \
+                "ardftsrc-bridge[diag startup]: first block written at +{:.0}ms after t_start \
+                 (link_wait={:.0}ms since the output node was created); \
                  block={block_out_frames}f gate={ingest_high_water}f({:.1}ms) \
                  drift setpoint={ready_target}f({:.1}ms) band={READY_BAND}f",
                 t_start.elapsed().as_secs_f64() * 1000.0,
+                t_out_open.elapsed().as_secs_f64() * 1000.0,
                 ingest_high_water as f64 * 1000.0 / TARGET_RATE as f64,
                 ready_target as f64 * 1000.0 / TARGET_RATE as f64,
             );
@@ -1900,15 +1940,27 @@ fn main() {
             floor_strikes = 0;
             trim_bursts = 0;
 
+            // ★ `out` is the ONE compartment this reset leaves standing, and it is the only
+            // remaining candidate for a per-start latch inside the bridge (capture is closed:
+            // 76 h of `capp10` read min==med==max==64f). Print it in ms and against OUT_BUFFER
+            // — `delay()` on this PCM runs PAST the ALSA ring (2048->2550f observed), so the
+            // overshoot is the plugin's own queue and is not visible from the frame count
+            // alone. `link_wait` rides along so a single line pairs the phase term with what
+            // the reset could not clear, instead of having to join two lines by timestamp.
+            let out_at_reset = out_pcm.delay().unwrap_or(-1);
             eprintln!(
                 "ardftsrc-bridge[diag race-reset]: consumer proven draining at {}f written; \
-                 shed ring={}f({:.1}ms) ready={}f({:.1}ms) out=KEPT {}f cap=NOT-CLEARED {}f({:.1}ms)",
+                 link_wait={:.0}ms shed ring={}f({:.1}ms) ready={}f({:.1}ms) \
+                 out=KEPT {}f({:.1}ms, {:+}f vs OUT_BUFFER) cap=NOT-CLEARED {}f({:.1}ms)",
                 out_frames_written,
+                t_out_open.elapsed().as_secs_f64() * 1000.0,
                 pre_ring / channels,
                 (pre_ring / channels) as f64 * 1000.0 / rate as f64,
                 pre_ready / channels,
                 (pre_ready / channels) as f64 * 1000.0 / TARGET_RATE as f64,
-                out_pcm.delay().unwrap_or(-1),
+                out_at_reset,
+                out_at_reset as f64 * 1000.0 / TARGET_RATE as f64,
+                out_at_reset - OUT_BUFFER,
                 pre_cap,
                 if pre_cap < 0 { 0.0 } else { pre_cap as f64 * 1000.0 / rate as f64 },
             );
