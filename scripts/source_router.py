@@ -64,6 +64,33 @@ import tv_ac3_extract   # IEC 61937 constants (PA_LE/PB_LE, data-type sets) — 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [SourceRouter] %(message)s')
 
+# ── Self-timing (2026-09-07) ────────────────────────────────────────────────────────
+# This daemon is the ONE component common to every path that shows latency outliers, and
+# it had no record of its own cost. Measured on the live Pi: `pw-dump` 37-53 ms (median
+# 38, n=12), `systemctl is-active` 8 ms, `amixer` 3 ms ⇒ ~100 ms of subprocess work per
+# 500 ms poll, PLUS a 1 s `arecord` on hw:eARC every EARC_PROBE_INTERVAL whenever no TV
+# bridge holds the device. None of that was visible.
+#
+# ⌀ Purpose is CORRELATION, not attribution: the NDI transmitter logs `delayp50` every 5 s
+# and its states are quantised (~0.18/2.2/4.2 ms, ledger §7.11), so a timestamped record of
+# when this daemon was unusually busy can be correlated against delay-state transitions
+# passively, over days, with no audio interruption and no probe runs.
+# ⛔ That reaches ONE variance component. §7.11: the residual +-1.5-3 ms draw is invisible
+# to every passive instrument, and the within-instance excursion class is unmeasured by
+# anything passive. A null here does NOT mean "source_router is not implicated".
+#
+# Volume is kept low deliberately: one summary line per minute, plus an immediate warning
+# only when a duration crosses a threshold set well above the measured spread.
+TIMING_WINDOW_S     = 60.0
+PW_DUMP_SLOW_MS     = 150    # vs a 38 ms median / 53 ms worst of 12
+# ⚠ Applied to the poll iteration NET OF THE eARC PROBE. Raising the threshold instead was
+# the obvious fix and is worse: measured 2026-09-07, a probe that FAILS still costs ~581 ms
+# and pushed whole iterations to 663-814 ms, so a threshold clearing that band would have to
+# sit near 1200 ms and would then miss every genuine stall between 400 and 1200. Subtracting
+# a cost we already measure separately keeps the original sensitivity.
+POLL_SLOW_MS        = 400    # vs ~96 ms measured p50 once the probe is excluded
+EARC_PROBE_SLOW_MS  = 1600   # vs ~1000 ms nominal (arecord -d 1)
+
 CDSP_IP   = "127.0.0.1"
 CDSP_PORT = 1234
 
@@ -239,6 +266,9 @@ class SourceRouter:
         self._earc_codec_unsupported = None      # label currently being reported
 
         self._reconcile_lock = asyncio.Lock()
+        self._timing = {}                   # name -> [ms]; see _record()/_emit_timing()
+        self._timing_since = time.monotonic()
+        self._probe_ms_this_iter = 0.0      # subtracted from `poll`; see poll_loop()
 
         # ── CamillaDSP ───────────────────────────────────────────────────────
         self.cdsp = CamillaClient(CDSP_IP, CDSP_PORT)
@@ -327,8 +357,36 @@ class SourceRouter:
     # (XDG_RUNTIME_DIR / PIPEWIRE_REMOTE) is provided by the service unit at deploy
     # (Risk #8); subprocesses inherit it from os.environ.
 
+    def _record(self, name: str, ms: float, slow_ms: float):
+        """Accumulate one duration, and warn immediately if it crosses `slow_ms`.
+
+        The warning is the part that matters for correlation: outliers are what would
+        line up with a delay-state transition. The window summary is only the baseline
+        needed to tell an outlier from a shifted normal."""
+        self._timing.setdefault(name, []).append(ms)
+        if ms >= slow_ms:
+            logging.warning(f"[srtiming] SLOW {name}={ms:.0f}ms (threshold {slow_ms:.0f}).")
+
+    def _emit_timing(self):
+        """One summary line per TIMING_WINDOW_S, then reset. Quiet by construction."""
+        if time.monotonic() - self._timing_since < TIMING_WINDOW_S:
+            return
+        parts = []
+        for name in sorted(self._timing):
+            v = sorted(self._timing[name])
+            if not v:
+                continue
+            p50 = v[len(v) // 2]
+            p90 = v[min(len(v) - 1, (len(v) * 9) // 10)]
+            parts.append(f"{name} n={len(v)} p50={p50:.0f} p90={p90:.0f} max={v[-1]:.0f}")
+        if parts:
+            logging.info("[srtiming window] " + " | ".join(parts) + " (ms)")
+        self._timing.clear()
+        self._timing_since = time.monotonic()
+
     def _pw_dump(self) -> list:
         """Return the parsed `pw-dump` object list, or [] on failure."""
+        t0 = time.monotonic()
         try:
             r = subprocess.run(["pw-dump", "-N"], capture_output=True, text=True,
                                timeout=PW_TIMEOUT)
@@ -336,6 +394,11 @@ class SourceRouter:
         except Exception as exc:
             logging.debug(f"pw-dump failed: {exc}")
             return []
+        finally:
+            # In `finally` so a timeout or a parse failure is timed too — a pw-dump that
+            # blocks is exactly the event worth catching, and it is the one that returns
+            # through the except branch.
+            self._record("pwdump", (time.monotonic() - t0) * 1000.0, PW_DUMP_SLOW_MS)
 
     @staticmethod
     def _props(obj: dict) -> dict:
@@ -854,7 +917,13 @@ class SourceRouter:
             return
         self._earc_probe_after = now + self.EARC_PROBE_INTERVAL
 
+        t0 = time.monotonic()
         mode, rate = await self._probe_earc()
+        probe_ms = (time.monotonic() - t0) * 1000.0
+        self._record("earcprobe", probe_ms, EARC_PROBE_SLOW_MS)
+        # Charged back to the poll iteration below: the probe is `await`ed inline, so it
+        # inflates the iteration by its own cost without being an anomaly.
+        self._probe_ms_this_iter += probe_ms
         if mode is None:
             # No bit clock (TV off / link down) or device busy. Mark idle so
             # reconcile drops the TV source; retry after the interval.
@@ -1501,6 +1570,8 @@ class SourceRouter:
 
     async def poll_loop(self):
         while True:
+            t0 = time.monotonic()
+            self._probe_ms_this_iter = 0.0
             try:
                 await self._update_ardftsrc_bridges()   # start/stop bridges -> source.X.ardftsrc nodes
                 await self.reconcile()             # link the nodes the bridges created
@@ -1508,6 +1579,14 @@ class SourceRouter:
                 await self._poll_bt_state()
             except Exception as exc:
                 logging.error(f"poll_loop iteration failed: {exc}")
+            # Timed OUTSIDE the try so a raising iteration is still recorded — and the
+            # whole iteration, not its parts, is what competes with the audio graph.
+            # NET of the eARC probe: that cost is real but known and separately recorded,
+            # so leaving it in would have meant one SLOW line every 5 s forever while the
+            # TV is off (~18k/day) and no sensitivity left for anything smaller.
+            poll_ms = (time.monotonic() - t0) * 1000.0 - self._probe_ms_this_iter
+            self._record("poll", max(poll_ms, 0.0), POLL_SLOW_MS)
+            self._emit_timing()
             await asyncio.sleep(POLL_INTERVAL)
 
     async def start(self):
