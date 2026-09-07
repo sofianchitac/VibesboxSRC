@@ -1050,6 +1050,17 @@ class SourceRouter:
             # here. Keep this line: it is the only honest source for the link time, and the
             # day the 37 ms stops holding is the day it matters.
             #
+            # ⛔⛔ SAMPLING CAVEAT ON ALL OF THE ABOVE. Six of those seven starts came from
+            # `systemctl restart`, WHICH THIS APPLIANCE NEVER DOES — in production the bridge
+            # is always started from an ALSA-active transition a few lines up. So the
+            # representative n is **1**, and that sample read 35.0 ms against the artificial
+            # cluster's 37.0-38.1. The phase argument still kills the poll hypothesis and the
+            # representative sample does not contradict the band, so the conclusion stands —
+            # but it is n=1 representative, and the same artificial-sampling mistake already
+            # produced one wrong conclusion today about `out` at the reset (ledger §7.13).
+            # ⇒ Read more NATURAL source starts before treating any of this as settled; this
+            #   line logs them for free. Do NOT run another restart series.
+            #
             # Quiet by construction: only fires when the link set actually changes, i.e. at
             # a source start/stop, not on the 2 Hz steady-state pass.
             if added:
