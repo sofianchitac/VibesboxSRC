@@ -1027,24 +1027,28 @@ class SourceRouter:
 
             # ★ 2026-09-07: timestamp the moment a node actually gains its links. This
             # line exists because the only other candidate — the "<source>: active" state
-            # log — is NOT the link event and is badly late: measured on the @usb start at
-            # 18:00:45.910 vs "active" at 18:00:46.504, it trails the real link by 595 ms.
-            # Anything reasoned from `active` as a link proxy is wrong by about that much.
+            # log — is NOT the link event and is badly late: measured at 18:00:45.910 vs
+            # "active" at 18:00:46.504, it trails the real link by 595 ms. Anything reasoned
+            # from `active` as a link proxy is wrong by about that much.
             #
-            # What the one measured start shows: bridge exec 44.644, output node created
-            # 45.875, LINK 45.910 (35 ms later), first write 45.992, race reset 46.032. So
-            # reconcile can land almost immediately after the node appears — but it is a 2 Hz
-            # poll that is not phased to the bridge, so the delay is a per-start draw from
-            # roughly [0, POLL_INTERVAL].
+            # ★★ MEASURED n=7 (@usb, six `systemctl restart` 20 s apart + one source_router
+            # start): node-creation -> LINK is **35.0-38.1 ms**, a 3 ms band. The reset then
+            # fires a further **120-122 ms** later, every time. ⇒ **the link always wins**,
+            # and the bridge's `out_frames_written > 2 * OUT_BUFFER` trigger has never yet
+            # been observed firing without a consumer attached.
             #
-            # ⚠ That makes the ORDER of the link and the bridge's race reset a per-start
-            # lottery. The reset fires ~157 ms after node creation (~117 ms to first write,
-            # ~40 ms more to cross `out_frames_written > 2 * OUT_BUFFER`), so a link drawn
-            # earlier than that gives a valid reset and a later one gives a reset with no
-            # consumer attached — `writei` into an unlinked node SUCCEEDS, the node runs
-            # against Dummy-Driver and its output goes nowhere, so the trigger cannot tell
-            # the two apart. n=1 measured here; treat the ordering as unresolved, not as a
-            # known defect, until more starts are logged.
+            # ⛔ NOT a draw from [0, POLL_INTERVAL] — that prediction is DEAD. The six
+            # restarts were 20.034 s apart, i.e. ~34 ms of poll-phase advance each, so a
+            # poll-driven delay had to walk 38 -> 72 -> 106 ms or wrap. It did not move.
+            # ⌀ Mechanism UNEXPLAINED: reconcile has exactly two callers (poll_loop at 2 Hz
+            # and _bt_start_pairing), so a 37 ms causal response should not be possible from
+            # what is in this file. Recorded as unexplained rather than re-theorised.
+            #
+            # ⚠ The failure mode is still real in principle — `writei` into an UNLINKED node
+            # SUCCEEDS (PipeWire runs it against Dummy-Driver, output goes nowhere), so a
+            # successful write proves nothing about a consumer. It is simply not what happens
+            # here. Keep this line: it is the only honest source for the link time, and the
+            # day the 37 ms stops holding is the day it matters.
             #
             # Quiet by construction: only fires when the link set actually changes, i.e. at
             # a source start/stop, not on the 2 Hz steady-state pass.
