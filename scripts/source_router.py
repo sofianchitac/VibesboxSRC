@@ -3,19 +3,27 @@
 Source Router Daemon — VibesboxSRC v2 (PipeWire backbone)
 
 Replaces auto_router.py. PipeWire is the audio graph, hard-pinned to 96 kHz. Every
-unmuted, playing source is summed (by PipeWire, in F32) into CamillaDSP's NATIVE PipeWire
-capture node "dsp-in"; CamillaDSP's playback node "dsp-out" is linked straight into the NDI
-transmitter's own capture node "ndi-tx-in" (8ch NDI — the only output transport since the Pi 5
-migration dropped the HiFiBerry; the v2-era S/PDIF selector and, since 2026-08-21, the
+unmuted, playing source is summed (by PipeWire, in F32) into the null-sink node "sink.dsp-sum"
+(config/pipewire/pipewire.conf.d/12-vibesbox-sum.conf); its monitor is linked straight into the
+NDI transmitter's own capture node "ndi-tx-in" (8ch NDI — the only output transport since the
+Pi 5 migration dropped the HiFiBerry; the v2-era S/PDIF selector and, since 2026-08-21, the
 sink.ndi-feed/snd-aloop hop it fed are both retired — see git history).
+
+★ 2026-09-08: CamillaDSP is OFF the audio path. The same monitor also feeds its capture node
+"dsp-in", but only as a METERING TAP — the RMS its WebSocket serves to the QML meters and to
+_check_multichannel() below. Its playback node "dsp-out" goes to "sink.dsp-void", which exists
+only because an unlinked PipeWire playback stream blocks and would stall it. It was the sum
+node until now for historical reasons only: its source-native -> 96 kHz conversion moved to the
+ardftsrc bridges and its routing matrix moved to REAPER years apart, leaving a 1:1 8ch mixer at
+gain 0 in the middle of the only audio path.
 
 This daemon's whole job is routing + state, not pipeline reconfiguration:
   * discover source nodes in the graph (poll `pw-dump`, ~2 Hz — NOT pw-mon streaming,
     which the house style distrusts; cf. auto_router.py's bluetoothctl-monitor note)
-  * link each playing + unmuted source into dsp-in (FL/FR for stereo, all 6 for USB),
+  * link each playing + unmuted source into sink.dsp-sum (FL/FR for stereo, all 6 for USB),
     unlink muted or stopped ones — mute IS link/unlink
-  * on startup: push dsp_8ch to CamillaDSP and link dsp-out -> ndi-tx-in;
-    start ndi-output
+  * on startup: push dsp_8ch to CamillaDSP and link the sum monitor -> ndi-tx-in and
+    -> dsp-in; start ndi-output
   * run the manual Bluetooth pairing state machine (pairing is the only manual step;
     once connected, BT mixes in like any source)
   * serve the :8080 WebSocket the UI subscribes to
@@ -103,13 +111,26 @@ SOURCES_MUTED_STATE_FILE = "/opt/vibesbox-src/state/sources_muted"
 
 OUTPUT_RATE = 96000
 
+# THE sum bus: a PipeWire null sink created by the daemon itself, from
+# config/pipewire/pipewire.conf.d/12-vibesbox-sum.conf. Sources link into its playback_*
+# inputs; its monitor_* outputs feed the NDI transmitter and CamillaDSP's metering tap.
+# ⚠ Unlike ndi-tx-in this is a DEVICE node, present for the life of the PipeWire daemon —
+# so it does not come and go, and reconcile() finds it on the first pass after boot.
+SUM_NODE = "sink.dsp-sum"
+
+# Where CamillaDSP's output goes to die. It is not optional: an unlinked PipeWire playback
+# stream BLOCKS, which would stall CamillaDSP and freeze the RMS. Same config file.
+VOID_NODE = "sink.dsp-void"
+
 # CamillaDSP's native-backend node names (camilladsp/dsp_*.yml devices block).
-DSP_IN_NODE  = "dsp-in"    # CDSP capture  — sources link their outputs into its inputs
-DSP_OUT_NODE = "dsp-out"   # CDSP playback — its outputs link into the active sink's inputs
+# ★ 2026-09-08: METERING ONLY. dsp-in captures the sum monitor so CamillaDSP can compute RMS;
+# dsp-out is discarded into sink.dsp-void. Neither is in the audio path any more.
+DSP_IN_NODE  = "dsp-in"    # CDSP capture  — fed from the sum monitor, for RMS
+DSP_OUT_NODE = "dsp-out"   # CDSP playback — discarded into sink.dsp-void, see VOID_NODE
 
 # THE output node: the NDI transmitter's own PipeWire capture stream, named by PIPEWIRE_ALSA
-# in services/ndi-output.service. dsp-out links straight into it — measured 2026-08-21 as
-# 18.5-20.0 ms cheaper than the sink.ndi-feed -> snd-aloop -> ALSA path it replaced (four
+# in services/ndi-output.service. The sum monitor links straight into it — measured 2026-08-21
+# as 18.5-20.0 ms cheaper than the sink.ndi-feed -> snd-aloop -> ALSA path it replaced (four
 # interleaved block pairs, two rates; docs/ndi-loopback-hop-brief.md).
 # ⚠ This is a CLIENT STREAM, not a device sink: it appears and disappears with the ndi-output
 # process, and reconcile() (2 Hz) is what links it each time.
@@ -1007,56 +1028,91 @@ class SourceRouter:
 
             dsp_in_id  = names.get(DSP_IN_NODE)
             dsp_out_id = names.get(DSP_OUT_NODE)
+            sum_id     = names.get(SUM_NODE)
 
             desired = set()                 # (out_port_id, in_port_id)
             managed_out_nodes = set()       # node ids whose output links we own
 
-            # ── dsp-out -> ndi-tx-in (the only output transport) ─────────────
-            # CamillaDSP always runs the 8ch passthrough; all 8 dsp-out channels
-            # link into the transmitter's capture node. The v2-era NDI/S-PDIF
-            # selector and the sink.ndi-feed hop are both retired.
+            # ── dsp-out -> sink.dsp-void (2026-09-08) ────────────────────────
+            # CamillaDSP is off the audio path but still needs its output to GO somewhere:
+            # an unlinked PipeWire playback stream blocks (measured — `aplay` sat 148 s
+            # having consumed 49 571 bytes, rchar frozen), which would stall CamillaDSP and
+            # freeze the RMS the meters and _check_multichannel() depend on. sink.dsp-void
+            # discards it. ⚠ Also keeps dsp_out_id MANAGED, so the link the old topology
+            # authored (dsp-out -> ndi-tx-in) falls out of `current - desired` and is cleaned
+            # on the first pass — otherwise a source-router restart without a camilladsp
+            # restart would leave CamillaDSP feeding the transmitter alongside the sum
+            # monitor, i.e. the same audio summed with itself one cycle apart.
             if dsp_out_id is not None:
                 managed_out_nodes.add(dsp_out_id)
-                src_p = out_ports.get(dsp_out_id, {})
+                void_id = names.get(VOID_NODE)
+                if void_id is not None:
+                    src_p = out_ports.get(dsp_out_id, {})
+                    dst_p = in_ports.get(void_id, {})
+                    for ch in CH8:
+                        if ch in src_p and ch in dst_p:
+                            desired.add((src_p[ch], dst_p[ch]))
+
+            # ── sum monitor -> ndi-tx-in (the only output transport) ─────────
+            # All 8 monitor channels link into the transmitter's capture node. The v2-era
+            # NDI/S-PDIF selector and the sink.ndi-feed hop are both retired.
+            if sum_id is not None:
+                managed_out_nodes.add(sum_id)
+                src_p = out_ports.get(sum_id, {})
                 # ⚠ Retired 2026-08-21: dsp-out used to feed sink.ndi-feed, an snd-aloop
                 # wrapper the transmitter then read back through ALSA. Measured at 18.5-20.0 ms
                 # for the round trip through the sink's own output buffer and the loopback, so
-                # the sink, its WirePlumber rules and the NDITX card are all gone. With no
-                # device node left in this group the graph is driven by PipeWire's timer-based
-                # Dummy-Driver; the rate domain is unchanged (ledger §4: the aloop clock WAS
-                # system time, +0.02 ppm).
+                # the sink, its WirePlumber rules and the NDITX card are all gone. The graph is
+                # driven by PipeWire's timer-based Dummy-Driver and MUST STAY THAT WAY — the
+                # 2026-09-08 sum/void sinks are `node.driver = false` for exactly that reason
+                # (a driver null sink stalled the chain ~8 s when it was tried); the rate
+                # domain is unchanged (ledger §4: the aloop clock WAS system time, +0.02 ppm).
                 consumer = NDI_TX_NODE
                 if (consumer in names) != self._tx_node_present:
                     self._tx_node_present = consumer in names
                     logging.info(f"{consumer}: "
-                                 + ("present — linking dsp-out into it."
+                                 + ("present — linking the sum monitor into it."
                                     if self._tx_node_present else
                                     "GONE — no output transport until ndi-output is back."))
                 cid = names.get(consumer)
                 if cid is not None:
                     dst_p = in_ports.get(cid, {})
-                    # CH8, not CH6 — dsp-out and the transmitter are both 8 wide, and a
+                    # CH8, not CH6 — the sum bus and the transmitter are both 8 wide, and a
                     # CH6 loop silently left lanes 7-8 unlinked (i.e. the surrounds the
                     # chain was widened to keep). Safe at either width: the membership
                     # test below only links ports that actually exist on both nodes.
-                    # ★ POSITIONAL: dsp-out lane N goes to the transmitter's lane N, so
-                    # CamillaDSP channel N is NDI channel N. _index() keys BOTH sides by
-                    # port index and ignores ndi-tx-in's port names, because they are not
-                    # in the order they look like: MEASURED 2026-08-23, the ALSA `pipewire`
-                    # plugin's 8ch capture stream exposes ALSA's own order,
-                    # FL FR RL RR FC LFE SL SR. Name-matching against that sent dsp-out 3/4
-                    # to NDI 5/6 and dsp-out 5/6 to NDI 3/4 — the exact inverse of the
-                    # (FC,LFE)<->(RL,RR) scramble the TV-bitstream and USB sources carry, so
-                    # from 753ee08 (2026-08-21) until this change the NDI wire silently
-                    # un-scrambled them and REAPER's corrective remap ran on already-correct
-                    # audio. The retired hw:NDITX,1,0 loopback was positional for free
-                    # (unpositioned aloop ports); this restores that, and is immune to
-                    # either side's naming. ⛔ Never fix a lane order with a remap here.
+                    # ★ POSITIONAL ON THE TRANSMITTER SIDE: sum-bus lane N goes to the
+                    # transmitter's lane N. _index() keys ndi-tx-in by port index and ignores
+                    # its port NAMES, because they are not in the order they look like:
+                    # MEASURED 2026-08-23, the ALSA `pipewire` plugin's 8ch capture stream
+                    # exposes ALSA's own order, FL FR RL RR FC LFE SL SR. Name-matching
+                    # against that sent bus 3/4 to NDI 5/6 and bus 5/6 to NDI 3/4 — the exact
+                    # inverse of the (FC,LFE)<->(RL,RR) scramble the TV-bitstream and USB
+                    # sources carry, so from 753ee08 (2026-08-21) until that fix the NDI wire
+                    # silently un-scrambled them and REAPER's corrective remap ran on
+                    # already-correct audio. ⛔ Never fix a lane order with a remap here.
+                    # ⚠ The sum side is keyed by NAME, and that is not interchangeable with
+                    # position: sink.dsp-sum's monitor port OBJECT IDs are not in position
+                    # order (measured: 146,154,147,155,148,156,149,157). Its audio.position
+                    # in 12-vibesbox-sum.conf is what makes CH8 correct here.
                     for ch in CH8:
                         if ch in src_p and ch in dst_p:
                             desired.add((src_p[ch], dst_p[ch]))
 
-            # ── each source -> dsp-in (FL/FR or all 6), if unmuted ──────────
+                # ── sum monitor -> dsp-in (CamillaDSP, METERING ONLY) ────────
+                # CamillaDSP is no longer in the audio path; it captures the same monitor
+                # purely so its WebSocket keeps serving the RMS the QML meters and
+                # _check_multichannel() read. dsp-in's ports report audio.channel="UNK",
+                # so _index()'s positional fallback keys them under CH8 — same convention
+                # as the monitor side, so lane N stays lane N and the meters keep matching
+                # what NDI carries.
+                if dsp_in_id is not None:
+                    dst_p = in_ports.get(dsp_in_id, {})
+                    for ch in CH8:
+                        if ch in src_p and ch in dst_p:
+                            desired.add((src_p[ch], dst_p[ch]))
+
+            # ── each source -> sink.dsp-sum (FL/FR or all 6), if unmuted ────
             # Linking is decoupled from `state == "running"`: a PW client launched
             # with node.autoconnect=false (squeezelite -o pipewire, shairport via
             # pipewire-alsa, source_router-managed bluez nodes) needs a downstream
@@ -1084,14 +1140,14 @@ class SourceRouter:
                     logging.info(f"{name}: idle.")
                 self.sources_playing[name] = running
 
-                if not self.sources_muted[name] and dsp_in_id is not None:
+                if not self.sources_muted[name] and sum_id is not None:
                     # Explicit width -> port-list map. This was `CH6 if channels == 6 else
                     # CH2`, which sent the new 8ch TV source down the STEREO branch and
                     # linked 2 of its 8 lanes — the deploy looked healthy and quietly
                     # dropped more than the bug it was fixing (2026-08-13).
                     chs = {8: CH8, 6: CH6}.get(spec["channels"], CH2)
                     src_p = out_ports.get(nid, {})
-                    dst_p = in_ports.get(dsp_in_id, {})
+                    dst_p = in_ports.get(sum_id, {})
                     for ch in chs:
                         if ch in src_p and ch in dst_p:
                             desired.add((src_p[ch], dst_p[ch]))
