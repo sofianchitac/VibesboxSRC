@@ -5,11 +5,17 @@ place. Nothing here runs on its own.
 
 ## The audio graph
 
-**`pipewire/`** pins the graph to 96 kHz and sets the buffer and resampler behaviour.
-This is where the "everything is 96 kHz" guarantee is actually enforced — the per-source
-bridges convert *to* 96 kHz precisely because the graph will not negotiate anything else.
-PipeWire's adaptive resampler stays in the path deliberately, to absorb drift between the
-source clocks and the graph clock.
+**`pipewire/`** pins the graph to 96 kHz and sets the buffer behaviour, and declares the two
+null sinks the signal path is built from: `sink.dsp-sum`, the sum bus every source links into
+and whose monitor feeds the NDI transmitter, and `sink.dsp-void`, where CamillaDSP's output is
+discarded. This is where the "everything is 96 kHz" guarantee is actually enforced — the
+per-source bridges convert *to* 96 kHz precisely because the graph will not negotiate anything
+else.
+
+> Source-vs-graph clock drift is absorbed by the bridges themselves, not downstream. Measured
+> 2026-09-08: the bridge's own regulator sheds the whole of the source clock offset, so nothing
+> after it applies any net rate correction. The two sinks are `node.driver = false` on purpose —
+> the graph is driven by PipeWire's timer, and a driver null sink stalls the audio path.
 
 **`wireplumber/`** names things and decides what is allowed to touch what. It gives the
 source nodes stable names (`source.usb`, …) so

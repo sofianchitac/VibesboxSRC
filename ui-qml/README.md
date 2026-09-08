@@ -21,9 +21,9 @@ apart from the control messages the buttons send back, so the touchscreen and th
 dashboard are always looking at the same truth.
 
 The three figures across the top are the whole system in miniature: the source's real rate
-in, 96 kHz through the resampler, NDI out. Below them the six meters are the sum bus
-channels — with a stereo source playing, FL and FR move and the other four sit silent,
-which is what "no upmixing here" looks like in practice.
+in, 96 kHz through the resampler, NDI out. Below them the meters are the sum bus channels,
+one per channel the router reports — with a stereo source playing, FL and FR move and the
+rest sit silent, which is what "no upmixing here" looks like in practice.
 
 <img src="../screenshots/src-unit.jpg" alt="The finished unit mounted on a wall, screen visible through the speaker grille cloth" width="380">
 

@@ -32,9 +32,9 @@ design, not a workaround.
  ────────────────────────      ──────────     ──────────────     ───────────────    ──────────────
  USB Host (UAC2, 44.1–192k) ─┐
  Lyrion / Squeezelite        │
- AirPlay / shairport         ├─▶ ardftsrc ─▶  PipeWire sum  ─▶   CamillaDSP    ──▶  NDI 5.1 (8ch)
- Tidal Connect               │   (→ 96 kHz)   (96 kHz; sums       (native PW;
- TV (eARC I2S tap)*          ┘                unmuted srcs)       8ch passthrough)
+ AirPlay / shairport         ├─▶ ardftsrc ─▶  sink.dsp-sum ─▶ monitor ─▶  NDI 5.1 (8ch)
+ Tidal Connect               │   (→ 96 kHz)   (96 kHz null sink;      │
+ TV (eARC I2S tap)*          ┘                sums unmuted srcs)      └─▶ CamillaDSP (RMS only)
  Bluetooth (PW-native A2DP) ─────────────────▶      │
 
  source_router.py — activity detect · bridge lifecycle · PipeWire routing · per-source
@@ -45,7 +45,7 @@ design, not a workaround.
 
 Two things about that diagram are worth stating explicitly, because they surprise people:
 
-**Nothing is upmixed here.** A stereo source occupies FL/FR and the other four channels
+**Nothing is upmixed here.** A stereo source occupies FL/FR and the other channels
 carry silence all the way to the DSP unit. All upmixing and all channel routing happen
 downstream. This box does not make creative decisions about the audio; it only makes the
 timing uniform.

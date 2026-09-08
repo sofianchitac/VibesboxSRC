@@ -32,10 +32,11 @@ hardware. `src/main.rs` holds a table of these per-source facts. Adding a source
 adding an entry there and a matching systemd instance.
 
 The TV is the awkward one. Its capture rate changes with the *format* — 48 kHz for LPCM,
-192 kHz for a DD+ bitstream — and I2S slave mode offers no way to detect the incoming rate.
-If the measured rate is not what this bridge expects, it refuses to start and logs why,
-rather than playing the stream at the wrong pitch. Silence with an explanation is easier
-to diagnose than audio that is 8% sharp.
+192 kHz for a DD+ bitstream — and I2S slave mode offers no way to ask what is arriving. So the
+bridge *measures* the rate off frame delivery, at startup and again every watchdog second, and
+snaps it onto the nearest standard rate. A rate that matches nothing standard is refused rather
+than resampled against a bad estimate: silence with an explanation is easier to diagnose than
+audio that is 8% sharp.
 
 ## Building
 

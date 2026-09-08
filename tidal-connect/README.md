@@ -8,7 +8,7 @@ Lyrion/AirPlay).
 tidal_connect_application (Docker, armhf)
   └─ PortAudio/ALSA → hw:Tidal,0,0 (snd-aloop card 15, playback side; format follows the track)
         └─ ardftsrc-bridge@tidal reads plughw:Tidal,1,0 → source.tidal.ardftsrc (96k, 2ch)
-              └─ source_router links FL/FR into dsp-in → sum bus → CamillaDSP → NDI
+              └─ source_router links FL/FR into the sum bus → NDI
 ```
 
 ## Why Docker

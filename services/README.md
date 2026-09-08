@@ -20,8 +20,12 @@ The units declare dependencies, but the intent is easier to read as a sequence:
 The unusual step is 4→5. CamillaDSP deliberately boots with no configuration at all, and
 `source-router` pushes it one once PipeWire is confirmed up. That push is what creates
 CamillaDSP's graph nodes, so a CamillaDSP that has never been pushed to is inert rather
-than broken. It also means restarting CamillaDSP on its own is safe — the router notices
-the reconnect and re-pushes.
+than broken. It also means restarting CamillaDSP on its own recovers cleanly — the router
+notices the reconnect and re-pushes.
+
+> ⚠ Recovers cleanly is not the same as silently. Its nodes leaving and rejoining forces a
+> PipeWire graph re-negotiation and the bridge sheds ~220 ms of backlog as one audible skip.
+> Don't bounce it while someone is listening.
 
 ## Templated units
 
