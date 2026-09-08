@@ -19,8 +19,7 @@
 //
 // PASS  = a node `source.gate1test.ardftsrc` appears with 2 ports FL/FR, unlinked
 //         (autoconnect=false → it does not auto-attach to anything).
-// FAIL  = no node, wrong name, wrong ports, or it auto-links → fall back to
-//         pipewire-rs native output (bigger lift; see the plan's Gate 1 fallback).
+// FAIL  = no node, wrong name, wrong ports, or it auto-links.
 
 use std::env;
 use std::f64::consts::PI;
