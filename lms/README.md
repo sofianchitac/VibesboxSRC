@@ -36,7 +36,7 @@ ssh "$LMS_HOST" "mkdir -p $LMS_APPDATA/bin"
 
 # 2. the plugin — note the directory, see the warning below
 scp -r lms/VibesboxTranscode "$LMS_HOST:$LMS_APPDATA/cache/Plugins/"
-ssh "$LMS_HOST" "chown -R nobody:users $LMS_APPDATA/cache/Plugins"
+ssh "$LMS_HOST" "chown -R nobody:users $LMS_APPDATA/cache/Plugins; chmod 755 $LMS_APPDATA/cache/Plugins/VibesboxTranscode/atmos-transcode.sh"
 
 # 3. disable native AAC in the LMS web UI, then restart the container
 ssh "$LMS_HOST" 'docker restart LyrionMusicServer'
@@ -53,5 +53,7 @@ Both `aac-flc-*-*` **and** `aac-flc-*-*-1` should appear on the File Types page:
 rule claimed the base profile name and the built-in faad rule was demoted. Conversion tables
 load only at startup, so every change to `custom-convert.conf` needs an LMS restart.
 
-Gain is handled by `-target_level`, a decoder option — see the comments in
-`custom-convert.conf` for why it must not be an `-af volume` filter.
+Level: `atmos-transcode.sh` measures the first minute of each E-AC-3 stream (one ebur128 pass) and applies a single
+static, true-peak-capped gain; genuine AAC is decoded untouched. Keep the player's ReplayGain
+**off** — Tidal's catalogue gain does not describe the Atmos stream. The why, and the two knobs,
+are in the comments of `custom-convert.conf` and the script.
