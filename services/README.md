@@ -37,6 +37,13 @@ bridge is a runtime question.
 Both use `Restart=on-failure` and exit 0 on a clean stop, which is what lets a format
 change tear a bridge down without systemd fighting the router to bring it back.
 
+## Independent of the audio chain
+
+`lgtv-input.service` only needs the network: it pairs with the LG TV once (accept the
+prompt on the TV; the key is kept in `state/`) and then tracks which input the TV is
+showing, for the bitstream bridge's per-device sync correction. If the TV is off or
+unreachable it reports nothing, and the bridge applies no correction.
+
 ## Third-party config
 
 `squeezelite.conf`, `shairport-sync.conf` and `tidal-connect.service` configure software

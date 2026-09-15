@@ -26,6 +26,14 @@ and feeds it into the same sum bus everything else uses. `tv_ac3_extract.py` is 
 demuxer it drives, and `pcm_backlog_trim.py` sits between the decoder and PipeWire to
 keep start-up backlog from turning into permanent latency.
 
+The same reservoir is also where a per-device sync correction is applied. Some HDMI
+sources send a bitstream early relative to their picture and there is nothing to be
+done about that at the source, so the bridge adds a fixed delay for that device and
+format only. It knows the format itself; which device is behind the TV it learns from
+`lgtv_input.py`, a small daemon that stays subscribed to the LG TV's webOS websocket and
+keeps the TV's foreground input in a file under `/run`. The TV announces an input change
+before the audio stream changes, so a fresh bridge always reads the right device.
+
 ## Now Playing
 
 `nowplaying_server.py` exposes track metadata over HTTP and WebSocket on `:8090`.
