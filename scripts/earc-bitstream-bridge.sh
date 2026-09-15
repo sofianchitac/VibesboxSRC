@@ -198,8 +198,9 @@ echo "earc-bitstream-bridge: $IN_DEVICE S32_LE ${RATE} 2ch (IEC 61937 ${FORMAT^^
 
 # ── Per-device level correction (2026-09-15) ──
 # AC-3 from the Google device (TV input hdmi3) arrives ~100 ms EARLY — audio leads the
-# picture — while AC-3 from the TV's own apps does not (filmed: settled −92 / −110 vs
-# webOS-app takes near zero). The format is known here; the DEVICE is read from the file
+# picture (filmed 2026-09-15: settled −92 / −110) — while AC-3 from the TV's own webOS apps
+# arrives LATE (+172..+187 filmed 2026-08-27), so it must NOT get this delay. The format is
+# known here; the DEVICE is read from the file
 # lgtv-input.service keeps current (the TV's foreground appId, empty while unreachable).
 # The delay is added as extra standing reservoir in pcm_backlog_trim.py. Read once at
 # start: an input change breaks the eARC stream, the extractor exits, and source_router
