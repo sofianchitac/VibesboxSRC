@@ -196,6 +196,21 @@ decode() {
 
 echo "earc-bitstream-bridge: $IN_DEVICE S32_LE ${RATE} 2ch (IEC 61937 ${FORMAT^^}) -> decode 5.1 [$DECODER] -> 48k f32 -> source.tv.ardftsrc (PipeWire SRC -> 96k)"
 
+# ── Per-device level correction (2026-09-15) ──
+# AC-3 from the Google device (TV input hdmi3) arrives ~100 ms EARLY — audio leads the
+# picture — while AC-3 from the TV's own apps does not (filmed: settled −92 / −110 vs
+# webOS-app takes near zero). The format is known here; the DEVICE is read from the file
+# lgtv-input.service keeps current (the TV's foreground appId, empty while unreachable).
+# The delay is added as extra standing reservoir in pcm_backlog_trim.py. Read once at
+# start: an input change breaks the eARC stream, the extractor exits, and source_router
+# starts a fresh bridge that re-reads this.
+EXTRA_DELAY_MS=0
+if [ "$FORMAT" = ac3 ] && [ "$(cat /run/vibesbox-lgtv-foreground 2>/dev/null)" = com.webos.app.hdmi3 ]; then
+    EXTRA_DELAY_MS=100
+    echo "earc-bitstream-bridge: TV input is hdmi3 (Google device) — adding ${EXTRA_DELAY_MS} ms to the AC-3 reservoir"
+fi
+export EXTRA_DELAY_MS
+
 # Channel map note: ffmpeg decodes to the canonical 5.1 order FL FR FC LFE RL RR (the
 # eARC DD+ decode was confirmed to be exactly this on 2026-07-28 — channel 4 measured
 # an order of magnitude less HF energy than the rest, i.e. LFE), but we deliberately

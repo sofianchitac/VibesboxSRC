@@ -641,6 +641,7 @@ SERVICES=(
     bt-agent.service
     ardftsrc-bridge@.service
     earc-bitstream-bridge@.service
+    lgtv-input.service
     nowplaying-server.service
     metadata-orchestrator.service
     fingerprint-capture.service

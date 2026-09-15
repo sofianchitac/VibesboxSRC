@@ -110,8 +110,13 @@ RATE_BPS = 48000 * FRAME
 #   earc-bitstream-bridge.sh's sweep sits BELOW one frame, not at it).
 DECODE_FRAME_SAMPLES = 1536         # AC-3/E-AC-3/DTS-core decode frame @48k
 PW_CAT_LATENCY_FRAMES = 1536        # MUST match EARC_PWCAT_LATENCY in earc-bitstream-bridge.sh
-PRIME = (PW_CAT_LATENCY_FRAMES + DECODE_FRAME_SAMPLES) * FRAME
-THRESH = int(0.192 * RATE_BPS) // FRAME * FRAME
+# EXTRA_DELAY_MS (from earc-bitstream-bridge.sh, 2026-09-15): a deliberate per-device latency
+# ADD, applied as extra standing reservoir. It shifts every level below by the same amount, so
+# the regulator's mechanics (trough setpoint, ceiling, hysteresis) are unchanged — the FIFO just
+# holds that much more, which is exactly the delay. Whole frames, so channel phase is preserved.
+EXTRA = int(int(os.environ.get("EXTRA_DELAY_MS", "0")) / 1000 * RATE_BPS) // FRAME * FRAME
+PRIME = (PW_CAT_LATENCY_FRAMES + DECODE_FRAME_SAMPLES) * FRAME + EXTRA
+THRESH = int(0.192 * RATE_BPS) // FRAME * FRAME + EXTRA
 STAT_S = 10.0
 
 # "The consumer is draining" has to be proven, not assumed: bytes we merely handed to the
@@ -135,7 +140,7 @@ BAND = 2 * GRAPH_QUANTUM * FRAME
 # TROUGH setpoint (not a fill level — see the docstring). pw-cat's own buffering target
 # is both the derived floor and, independently, the field's most common operating point:
 # 23 of 40 live instances sat here with a clean dry-out record.
-TARGET = PW_CAT_LATENCY_FRAMES * FRAME
+TARGET = PW_CAT_LATENCY_FRAMES * FRAME + EXTRA
 WINDOW_S = 0.5                          # trough measurement window
 CONVERGE_WINDOWS = 2                    # consecutive in-band windows before latching
 # Bound on convergence. Past this, latch wherever we are rather than keep splicing.
@@ -192,7 +197,8 @@ def main():
                 pass
         if priming and len(fifo) >= PRIME:
             priming = False
-            print(f"pcm-trim: primed {ms(len(fifo)):.1f}ms reservoir",
+            print(f"pcm-trim: primed {ms(len(fifo)):.1f}ms reservoir"
+                  + (f" (incl. {ms(EXTRA):.0f}ms extra delay)" if EXTRA else ""),
                   file=sys.stderr, flush=True)
         if w and fifo:
             try:

@@ -1,0 +1,16 @@
+[Unit]
+Description=LG TV foreground-input watcher (webOS websocket -> /run/vibesbox-lgtv-foreground)
+# Tells earc-bitstream-bridge.sh which device is behind the TV: AC3 from the Google device
+# arrives ~100 ms early (filmed 2026-09-15) and gets a matching delay; other AC3 does not.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/vibesbox-src/venv/bin/python3 /opt/vibesbox-src/scripts/lgtv_input.py
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
