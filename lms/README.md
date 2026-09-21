@@ -55,5 +55,5 @@ load only at startup, so every change to `custom-convert.conf` needs an LMS rest
 
 Level: `atmos-transcode.sh` measures the first minute of each E-AC-3 stream (one ebur128 pass) and applies a single
 static, true-peak-capped gain; genuine AAC is decoded untouched. Keep the player's ReplayGain
-**off** — Tidal's catalogue gain does not describe the Atmos stream. The why, and the two knobs,
+**off** — Tidal's catalogue gain does not describe the Atmos stream. The why, and the knobs,
 are in the comments of `custom-convert.conf` and the script.

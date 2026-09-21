@@ -691,6 +691,7 @@ systemctl enable \
     metadata-orchestrator.service \
     fingerprint-capture.service \
     party-mode.service \
+    lgtv-input.service \
     lattepanda-watcher.timer
 
 # NDI output: only enable if NDI SDK is present

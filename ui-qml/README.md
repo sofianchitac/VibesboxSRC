@@ -12,7 +12,7 @@ can only add latency and failure modes.
 
 ## What it shows
 
-<img src="../screenshots/touchscreen.jpg" alt="The QML touchscreen: rate readout, six-channel meters and the six source buttons" width="420">
+<img src="../screenshots/touchscreen.jpg" alt="The QML touchscreen: rate readout, the meters and the six source buttons" width="420">
 
 Source buttons with per-source state, level meters, Now Playing, a power menu and a
 brightness slider. State comes from `source_router.py`'s WebSocket on `:8080`; the RMS
