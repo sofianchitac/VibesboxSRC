@@ -2,6 +2,7 @@
 Description=LG TV foreground-input watcher (webOS websocket -> /run/vibesbox-lgtv-foreground)
 # Tells earc-bitstream-bridge.sh which device is behind the TV: AC3 from the Google device
 # arrives ~100 ms early (filmed 2026-09-15) and gets a matching delay; other AC3 does not.
+# Also forwards the TV remote's volume keys to the DSP via nowplaying-server (:8090).
 After=network-online.target
 Wants=network-online.target
 

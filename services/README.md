@@ -42,7 +42,9 @@ change tear a bridge down without systemd fighting the router to bring it back.
 `lgtv-input.service` only needs the network: it pairs with the LG TV once (accept the
 prompt on the TV; the key is kept in `state/`) and then tracks which input the TV is
 showing, for the bitstream bridge's per-device sync correction. If the TV is off or
-unreachable it reports nothing, and the bridge applies no correction.
+unreachable it reports nothing, and the bridge applies no correction. It also forwards
+the TV remote's volume keys to the DSP through `nowplaying-server`, so those keys do
+nothing while the TV is off or that service is down.
 
 ## Third-party config
 

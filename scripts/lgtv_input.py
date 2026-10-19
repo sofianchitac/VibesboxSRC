@@ -12,6 +12,13 @@ The foreground appId is also written to STATE_FILE (atomically; emptied while th
 unreachable) — earc-bitstream-bridge.sh reads it at start to decide whether the AC3 stream
 comes from the Google device and needs the ~100 ms delay. Runs as lgtv-input.service.
 
+It also turns the TV's volume keys (LG remote, or the Google remote's IR) into DSP volume
+steps: with the sound out on eARC the TV's own volume number changes nothing audible, but
+each key press arrives as a getVolume event with cause volumeUp/volumeDown, which is
+forwarded to nowplaying_server's /api/control/volume-fine/* (ReaLearn maps it to a finer
+step than the remote dashboard's volume buttons). The number is put back to VOL_CENTRE before it can stick at 0 or 100,
+and kept low in case the TV ever falls back to its own speakers.
+
 First run: the TV shows a pairing prompt — accept it on the TV. The client key is stored in
 KEY_FILE and reused. No new dependencies: plain `websockets`, port 3000 (ws).
 """
@@ -21,12 +28,23 @@ import json
 import logging
 import os
 import socket
+import time
+import urllib.request
 
 import websockets
 
 KEY_FILE = "/opt/vibesbox-src/state/lgtv-client-key"
 STATE_FILE = "/run/vibesbox-lgtv-foreground"
 SSDP_ST = "urn:lge-com:service:webos-second-screen:1"
+CONTROL_URL = "http://127.0.0.1:8090/api/control/volume-fine/"   # nowplaying_server -> OSC
+EARC_SCENARIO = "mastervolume_ext_speaker_arc"
+STEPS = {"volumeUp": "up", "volumeDown": "down"}
+VOL_LOW, VOL_HIGH, VOL_CENTRE = 3, 30, 15
+# A held key repeats every ~45 ms, after a ~380 ms pause behind the first event (measured
+# 2026-10-19) — the same spacing as quick separate presses, so a hold is only recognisable
+# once its 45 ms repeats start. Hence each event waits REPEAT_GAP to see whether repeats follow.
+REPEAT_GAP = 0.15
+HOLD_DELAY = 0.6
 
 # The payload aiowebostv 0.10 registers with (no signature needed on current webOS).
 REGISTER = {
@@ -37,7 +55,7 @@ REGISTER = {
             "APP_TO_APP", "READ_APP_STATUS", "READ_CURRENT_CHANNEL", "READ_INPUT_DEVICE_LIST",
             "READ_INSTALLED_APPS", "READ_LGE_TV_INPUT_EVENTS", "READ_NETWORK_STATE",
             "READ_POWER_STATE", "READ_RUNNING_APPS", "READ_SETTINGS", "TEST_OPEN",
-            "TEST_PROTECTED", "TEST_SECURE"]},
+            "TEST_PROTECTED", "TEST_SECURE", "CONTROL_AUDIO"]},
     },
 }
 
@@ -67,6 +85,40 @@ def write_state(app):
     os.replace(tmp, STATE_FILE)
 
 
+def dsp_step(direction):
+    try:
+        urllib.request.urlopen(urllib.request.Request(CONTROL_URL + direction, method="POST"),
+                               timeout=2).close()
+    except OSError as exc:
+        logging.warning(f"volume {direction} not sent: {exc}")
+
+
+class VolumeKeys:
+    """One DSP step per key press; a held key's auto-repeat counts as that one press."""
+
+    def __init__(self):
+        self.last_event = self.last_sent = 0.0
+        self.pending = None
+
+    def press(self, direction):
+        now = time.monotonic()
+        gap, self.last_event = now - self.last_event, now
+        if gap >= REPEAT_GAP:                          # maybe a press: wait for repeats
+            self.pending = asyncio.create_task(self._send_later(direction))
+        elif self.pending and not self.pending.done():  # repeats started: a hold
+            self.pending.cancel()
+            if now - self.last_sent > HOLD_DELAY:      # its initial press was not sent yet
+                self.pending = asyncio.create_task(self._send(direction))
+
+    async def _send_later(self, direction):
+        await asyncio.sleep(REPEAT_GAP)
+        await self._send(direction)
+
+    async def _send(self, direction):
+        self.last_sent = time.monotonic()
+        await asyncio.to_thread(dsp_step, direction)
+
+
 async def session(host):
     key = open(KEY_FILE).read().strip() if os.path.exists(KEY_FILE) else None
     async with websockets.connect(f"ws://{host}:3000", max_size=None) as ws:
@@ -92,7 +144,10 @@ async def session(host):
                                   "uri": "ssap://tv/getExternalInputList"}))
         await ws.send(json.dumps({"type": "subscribe", "id": "fg",
                                   "uri": "ssap://com.webos.applicationManager/getForegroundAppInfo"}))
-        labels, last = {}, None
+        await ws.send(json.dumps({"type": "subscribe", "id": "vol",
+                                  "uri": "ssap://audio/getVolume"}))
+        labels, last, scenario = {}, None, None
+        keys = VolumeKeys()
         while True:
             msg = json.loads(await ws.recv())
             p = msg.get("payload", {})
@@ -106,6 +161,24 @@ async def session(host):
                                  + (f" [{labels[app]}]" if app in labels else ""))
                     write_state(app)
                     last = app
+            elif msg.get("id") == "vol":
+                if msg.get("type") == "error":
+                    logging.warning(f"volume subscription refused: {msg.get('error')}")
+                    continue
+                if p.get("scenario", scenario) != scenario:
+                    scenario = p["scenario"]
+                    logging.info(f"sound scenario: {scenario}")
+                if scenario != EARC_SCENARIO:              # TV speakers: leave them alone
+                    continue
+                if p.get("cause") in STEPS:
+                    keys.press(STEPS[p["cause"]])
+                vol = p.get("volume")
+                if isinstance(vol, int) and not VOL_LOW <= vol <= VOL_HIGH:
+                    await ws.send(json.dumps({"type": "request", "id": "setvol",
+                                              "uri": "ssap://audio/setVolume",
+                                              "payload": {"volume": VOL_CENTRE}}))
+            elif msg.get("id") == "setvol" and msg.get("type") == "error":
+                logging.warning(f"setVolume refused: {msg.get('error')}")
 
 
 async def main():

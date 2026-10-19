@@ -34,6 +34,12 @@ format only. It knows the format itself; which device is behind the TV it learns
 keeps the TV's foreground input in a file under `/run`. The TV announces an input change
 before the audio stream changes, so a fresh bridge always reads the right device.
 
+The same daemon makes the TV remote a DSP volume control. With the sound going out over
+eARC, the TV's own volume does nothing audible, but it still reports every volume key
+press. `lgtv_input.py` forwards each one as a volume step through `nowplaying_server.py`,
+a finer step than the remote dashboard's buttons, and quietly resets the TV's number so
+it never gets stuck at an end of its range.
+
 ## Now Playing
 
 `nowplaying_server.py` exposes track metadata over HTTP and WebSocket on `:8090`.

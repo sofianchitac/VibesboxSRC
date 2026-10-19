@@ -65,8 +65,10 @@ REAPER_OSC_PORT = int(os.environ.get("REAPER_OSC_PORT", "8000"))
 # The only OSC the remote can emit. ReaLearn maps each <base>/up and <base>/down
 # to an Incremental button on the same target the Pico MIDI knobs drive; /down
 # uses ReaLearn's Reverse, so both directions carry a plain 1.0.
+# volume-fine is the same target with a smaller step, for the TV remote's keys.
 OSC_CONTROLS = {
     "volume": "/vibesbox/master/db",
+    "volume-fine": "/vibesbox/master/db/fine",
     "bass":   "/vibesbox/eq/bass",
     "treble": "/vibesbox/eq/treble",
 }
