@@ -170,6 +170,8 @@ fi
 
 systemctl daemon-reload
 step_ok "systemd daemon-reload"
+# Units added after first install are copied above but never enabled by install.sh's run.
+systemctl enable ndi-output-node.service 2>/dev/null
 
 # ── 4. Restart ──────────────────────────────────────────────────────────────
 # Order matters and mirrors the boot order: PipeWire/WirePlumber own the node
@@ -188,21 +190,21 @@ else
         systemctl restart camilladsp
         sleep 1
         systemctl restart source-router
-        systemctl restart ndi-output
-        step_ok "pipewire → wireplumber → camilladsp → source-router → ndi-output"
+        systemctl restart ndi-output ndi-output-node
+        step_ok "pipewire → wireplumber → camilladsp → source-router → ndi-output (+ Node feed)"
         # QML has no live-reload; the kiosk runs under the greetd session.
         systemctl restart greetd
         step_ok "greetd (QML kiosk)"
     else
         step_warn "Restart skipped — deployed files are NOT live yet."
-        echo "     sudo systemctl restart pipewire wireplumber camilladsp source-router ndi-output greetd"
+        echo "     sudo systemctl restart pipewire wireplumber camilladsp source-router ndi-output ndi-output-node greetd"
     fi
 fi
 
 # ── 5. Verify ───────────────────────────────────────────────────────────────
 echo "[5/6] Service status…"
 sleep 2
-for u in pipewire wireplumber camilladsp source-router ndi-output; do
+for u in pipewire wireplumber camilladsp source-router ndi-output ndi-output-node; do
     STATE="$(systemctl is-active "$u" 2>/dev/null)"
     if [[ "$STATE" == "active" ]]; then step_ok "$(printf '%-16s %s' "$u" "$STATE")"
     else step_fail "$(printf '%-16s %s' "$u" "$STATE")"; fi

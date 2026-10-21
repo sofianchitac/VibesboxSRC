@@ -2,7 +2,8 @@
 
 A Raspberry Pi 5 audio hub that takes every source in the house — USB, Lyrion, AirPlay,
 Tidal, Bluetooth, and the TV over HDMI eARC — resamples each one to 96 kHz, sums them in a
-PipeWire graph, and sends a single 8-channel 96 kHz stream out over the network as NDI.
+PipeWire graph, and sends a single 8-channel 96 kHz stream out over the network as NDI —
+plus a light stereo copy for a Wi-Fi player in a second room.
 
 It is one half of a two-box home audio system. This box normalises; a second box does the
 DSP. It has been running as an appliance in a living room since 2026, not as a project that

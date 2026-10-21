@@ -638,6 +638,7 @@ SERVICES=(
     alsa-loopback.service
     camilladsp.service
     ndi-output.service
+    ndi-output-node.service
     bt-agent.service
     ardftsrc-bridge@.service
     earc-bitstream-bridge@.service
@@ -696,10 +697,10 @@ systemctl enable \
 
 # NDI output: only enable if NDI SDK is present
 if [ -f /usr/local/lib/libndi.so ]; then
-    systemctl enable ndi-output.service
-    step_ok "NDI output service enabled"
+    systemctl enable ndi-output.service ndi-output-node.service
+    step_ok "NDI output services enabled (main + Node feed)"
 else
-    systemctl disable ndi-output.service 2>/dev/null || true
+    systemctl disable ndi-output.service ndi-output-node.service 2>/dev/null || true
     step_warn "NDI output service NOT enabled (libndi.so not found)"
 fi
 

@@ -1,0 +1,43 @@
+[Unit]
+Description=NDI Output — 2ch 48kHz feed for VibesboxNode (NDI SDK via Python)
+# A second instance of ndi_transmitter.py, for the Node in the second room. The Node is on
+# 2.4 GHz Wi-Fi and plays only FL/FR: the full 8ch/96k stream measured ~3 Mbit/s there,
+# more than that link sustains (router ping 3.5 ms avg without it, ~100 ms with it,
+# TCP resets every ~15 s; 2026-10-21). FL/FR at 48 kHz roughly halves it.
+# ⌀ Independent of ndi-output: the main stream to the LattePanda never depends on this unit.
+After=pipewire.service wireplumber.service network-online.target avahi-daemon.service
+Wants=network-online.target pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=/opt/vibesbox-src/venv/bin/python3 /opt/vibesbox-src/scripts/ndi_transmitter.py
+Restart=on-failure
+RestartSec=5
+User=root
+# Deliberately SCHED_OTHER (ndi-output runs FIFO 20): this feed must never preempt the main
+# transmitter. The capture buffer is sized for that instead — see NDI_ALSA_DEV.
+
+Environment="NDI_TX_NAME=Secondary Stereo"
+Environment=NDI_LIB_PATH=/usr/local/lib/libndi.so
+Environment=XDG_RUNTIME_DIR=/run/pipewire
+Environment=PIPEWIRE_REMOTE=pipewire-0
+
+# source_router links sink.dsp-sum's monitor FL/FR into this node (NDI_NODE_TX_NODE).
+Environment="PIPEWIRE_ALSA={ node.name=ndi-node-tx-in node.description=Vibesbox-NDI-Node-transmitter node.autoconnect=false }"
+
+# 48 kHz in a 96 kHz graph: PipeWire's stream adapter resamples. Latency is a non-goal on
+# the Node (it buffers ~1 s for Wi-Fi), so the period is 1024 and the buffer four periods
+# (85 ms) — room to ride out preemption at SCHED_OTHER.
+# ⚠ PERIOD_BYTES must equal NDI_PERIOD × NDI_ALSA_CH × 4 = 1024 × 2 × 4 = 8192.
+Environment=NDI_ALSA_DEV=pipewire:NODE=,PERIOD_BYTES=8192,BUFFER_BYTES=32768
+Environment=NDI_RATE=48000
+Environment=NDI_ALSA_CH=2
+Environment=NDI_PERIOD=1024
+
+# The latency instrumentation is calibrated for the main 512-frame chain: the setpoint
+# thermostat would splice this stream every 30 s, and b2tx reads the 96k bridges' stamps.
+Environment=NDI_SETPOINT_TRIM=0
+Environment=NDI_B2TX_TELEMETRY=0
+
+[Install]
+WantedBy=multi-user.target

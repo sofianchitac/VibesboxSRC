@@ -136,6 +136,10 @@ DSP_OUT_NODE = "dsp-out"   # CDSP playback — discarded into sink.dsp-void, see
 # process, and reconcile() (2 Hz) is what links it each time.
 NDI_TX_NODE = "ndi-tx-in"
 
+# The VibesboxNode's own feed (services/ndi-output-node.service): FL/FR only, at 48 kHz, for
+# its 2.4 GHz Wi-Fi link. Not an output transport for the DSP — its absence is not an error.
+NDI_NODE_TX_NODE = "ndi-node-tx-in"
+
 CH6 = ["FL", "FR", "FC", "LFE", "RL", "RR"]
 CH2 = ["FL", "FR"]
 # 8-wide since 2026-08-13. The eARC LPCM surrounds arrive on lanes 7-8 and the chain now
@@ -482,7 +486,7 @@ class SourceRouter:
                             ch = CH8[idx - 1]
                 # ndi-tx-in is keyed positionally too, by port.id — its port NAMES are
                 # deliberately ignored. See the dsp-out -> ndi-tx-in note in reconcile().
-                elif node_id_name.get(nid) == NDI_TX_NODE:
+                elif node_id_name.get(nid) in (NDI_TX_NODE, NDI_NODE_TX_NODE):
                     pidx = p.get("port.id")
                     ch = (CH8[int(pidx)]
                           if pidx is not None and 0 <= int(pidx) < len(CH8) else None)
@@ -526,7 +530,7 @@ class SourceRouter:
 
     def _pin_output_volume(self, names: dict):
         """Force the output node to unity once it appears (see _vol_pinned rationale)."""
-        for sink in (NDI_TX_NODE,):
+        for sink in (NDI_TX_NODE, NDI_NODE_TX_NODE):
             nid = names.get(sink)
             if nid is None:
                 # NDI_TX_NODE is a client stream and goes away with the ndi-output
@@ -1095,6 +1099,16 @@ class SourceRouter:
                     # position: sink.dsp-sum's monitor port OBJECT IDs are not in position
                     # order (measured: 146,154,147,155,148,156,149,157). Its audio.position
                     # in 12-vibesbox-sum.conf is what makes CH8 correct here.
+                    for ch in CH8:
+                        if ch in src_p and ch in dst_p:
+                            desired.add((src_p[ch], dst_p[ch]))
+
+                # ── sum monitor FL/FR -> ndi-node-tx-in (the Node's feed) ────
+                # Same positional keying as ndi-tx-in; the node is 2 wide, so the CH8 loop
+                # links FL/FR and nothing else.
+                nid = names.get(NDI_NODE_TX_NODE)
+                if nid is not None:
+                    dst_p = in_ports.get(nid, {})
                     for ch in CH8:
                         if ch in src_p and ch in dst_p:
                             desired.add((src_p[ch], dst_p[ch]))

@@ -12,7 +12,8 @@ The units declare dependencies, but the intent is easier to read as a sequence:
 3. `pipewire` + `wireplumber` — the 96 kHz audio graph and its session manager
 4. `camilladsp` — starts *without* a config (`-w`), so it locks no devices
 5. `source-router` — wires the graph up, pushes CamillaDSP its config, opens `:8080`
-6. `ndi-output` — the always-on NDI transmitter
+6. `ndi-output` — the always-on NDI transmitter; `ndi-output-node` — a second instance
+   sending FL/FR at 48 kHz as `Secondary Stereo`, for the Wi-Fi Node
 7. source services (`squeezelite`, `shairport-sync`, `tidal-connect`) and the on-demand
    `ardftsrc-bridge@` instances
 8. `greetd` — the touchscreen kiosk session
